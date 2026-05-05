@@ -251,6 +251,22 @@ __inline__ __device__ decltype(auto) add_result(D x, D y) {
   return x + y;
 }
 
+template <>
+__inline__ __device__ decltype(auto) add_result<__half2>(
+    __half2 x,
+    __half2 y) {
+  return __hadd2(x, y);
+}
+
+#if defined(__CUDACC__) && (__CUDA_ARCH__ >= 800 || !defined(__CUDA_ARCH__))
+template <>
+__inline__ __device__ decltype(auto) add_result<__nv_bfloat162>(
+    __nv_bfloat162 x,
+    __nv_bfloat162 y) {
+  return __hadd2(x, y);
+}
+#endif
+
 #ifdef __HIP_PLATFORM_AMD__
 template <>
 __inline__ __device__ decltype(auto) add_result<__hip_bfloat162>(

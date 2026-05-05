@@ -31,6 +31,7 @@ cpu_sources = [
     "silvertorch/ops/csrc/bloom_indexer.cpp",
     "silvertorch/ops/csrc/bloom_index_search.cpp",
     "silvertorch/ops/csrc/expression_query_parser.cpp",
+    "silvertorch/ops/csrc/fused_kmean_ann.cpp",
 ]
 
 cuda_sources = [
@@ -38,6 +39,7 @@ cuda_sources = [
     "silvertorch/ops/csrc/bloom_index_search_cuda.cu",
     "silvertorch/ops/csrc/expression_query_parser_cuda.cu",
     "silvertorch/ops/csrc/faster_repeat_interleave.cu",
+    "silvertorch/ops/csrc/fused_kmean_ann_cuda.cu",
 ]
 
 # Resolve paths relative to this file
