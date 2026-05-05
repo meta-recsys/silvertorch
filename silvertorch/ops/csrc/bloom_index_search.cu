@@ -29,7 +29,6 @@
 #include <vector>
 
 #define BLOOM_INDEX_CUDA
-#include "bloom_index_search.cuh"
 #include "bloom_index_util.cuh"
 #include "bloom_index_util.h"
 
@@ -650,7 +649,7 @@ __global__ void generate_column_info_for_clusters_kernel(
 std::tuple<Tensor, Tensor, Tensor> generate_column_info_for_clusters(
     const Tensor& selected_cluster_offsets,
     const Tensor& selected_cluster_lengths) {
-  // this funciton will be just one step of a kernel, so I didn't add
+  // this function will be just one step of a kernel, so I didn't add
   // device guard in this function, the guard will be the caller
   // function's responsibility.
   constexpr int64_t kThreads = 256L;
