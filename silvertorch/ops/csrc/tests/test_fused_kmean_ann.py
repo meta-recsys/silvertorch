@@ -25,6 +25,11 @@ import unittest
 import silvertorch.ops._load_ops  # noqa: F401
 import torch
 
+# fmt: off
+# @oss-disable[end= ]: torch.ops.load_library("//silvertorch/oss/ops/csrc:fused_kmean_ann")
+# @oss-disable[end= ]: torch.ops.load_library("//silvertorch/oss/ops/csrc:fused_kmean_ann_gpu")
+# fmt: on
+
 HAS_CUDA = torch.cuda.is_available()
 
 
