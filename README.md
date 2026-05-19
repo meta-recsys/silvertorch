@@ -30,7 +30,7 @@ PyTorch wheels are pinned to a specific CUDA toolkit version, and your local
 
 ### 1. Tested matrix
 
-These combinations are verified end-to-end (build + 73-test suite + benchmark).
+These combinations are verified end-to-end (build + OSS test suite + benchmark).
 
 | Python    | PyTorch       | CUDA toolkit | Notes                       |
 |-----------|---------------|--------------|-----------------------------|
@@ -66,7 +66,7 @@ pip install --no-build-isolation silvertorch
 For local development from a checkout:
 
 ```bash
-git clone https://github.com/<org>/silvertorch.git
+git clone https://github.com/meta-recsys/silvertorch.git
 cd silvertorch
 pip install --no-build-isolation -e .
 ```
@@ -81,7 +81,7 @@ assert hasattr(torch.ops.st, "bloom_index_search_batch")
 print("SilverTorch ready —", "GPU" if torch.cuda.is_available() else "CPU only")
 ```
 
-Run the test suite (expect 73 passed):
+Run the OSS test suite:
 
 ```bash
 pytest silvertorch/
