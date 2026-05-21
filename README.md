@@ -16,7 +16,7 @@ large-scale recommender systems, generative retrieval (RAG), and vector search â
 optimized for latency, throughput, and GPU cost efficiency.
 
 - **Version:** 1.0.0
-- **Contact:** Bi Xue, leich@meta.com, zhenwang@meta.com, pengxia@meta.com
+- **Contact:** Bi Xue, leich@meta.com, zhenwang@meta.com, pengxia@meta.com, jiazhouwang@meta.com
 - **License:** Apache 2.0
 
 ---
