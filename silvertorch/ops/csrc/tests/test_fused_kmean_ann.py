@@ -602,3 +602,153 @@ class TestFusedKmeanAnn(unittest.TestCase):
             embeddings = torch.randn(8, 16, dtype=dtype)
             queries = torch.randn(1, 16, dtype=dtype)
         return cluster_offsets, cluster_ids, cluster_length, embeddings, queries
+
+
+# ---------------------------------------------------------------------------
+# fused_kmean_ann_with_partial_masks tests
+# ---------------------------------------------------------------------------
+
+
+class TestFusedKmeanAnnWithPartialMasks(unittest.TestCase):
+    """Tests for fused_kmean_ann_with_partial_masks op."""
+
+    def test_registered(self) -> None:
+        self.assertTrue(hasattr(torch.ops.st, "fused_kmean_ann_with_partial_masks"))
+
+    def _make_partial_masks(
+        self,
+        cluster_offsets: torch.Tensor,
+        cluster_ids: torch.Tensor,
+        cluster_length: torch.Tensor,
+        device: str = "cpu",
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Generate all-pass partial masks (all bits set) for testing."""
+        batch_size = cluster_ids.size(0)
+        num_probes = cluster_ids.size(1)
+        total_clusters = batch_size * num_probes
+
+        cumsum_list = []
+        offset_list = []
+        mask_list = []
+        col_acc = 0
+        for b in range(batch_size):
+            for p in range(num_probes):
+                cid = int(cluster_ids[b, p].item())
+                clen = int(cluster_length[b, p].item())
+                doc_start = int(cluster_offsets[cid].item())
+                offset_in_col = doc_start % 64
+                num_cols = (clen + offset_in_col + 63) // 64 if clen > 0 else 0
+                col_acc += num_cols
+                cumsum_list.append(col_acc)
+                offset_list.append(offset_in_col)
+                for _ in range(num_cols):
+                    mask_list.append(-1)
+
+        col_cumsum = torch.tensor(cumsum_list, dtype=torch.int32, device=device)
+        first_offsets = torch.tensor(offset_list, dtype=torch.int8, device=device)
+        col_masks = torch.tensor(mask_list, dtype=torch.long, device=device)
+        return col_cumsum, first_offsets, col_masks
+
+    def test_cpu_basic(self) -> None:
+        n_clusters = 3
+        cluster_size = 32
+        dim = 64
+        total_docs = n_clusters * cluster_size
+        cluster_offsets = torch.arange(
+            0, total_docs + 1, cluster_size, dtype=torch.long
+        )
+        embeddings = torch.randn(total_docs, dim)
+        queries = torch.randn(2, dim)
+        cluster_ids = torch.tensor([[0, 1], [1, 2]], dtype=torch.long)
+        cluster_length = torch.full((2, 2), cluster_size, dtype=torch.long)
+        max_size = 2 * cluster_size
+
+        col_cumsum, first_offsets, col_masks = self._make_partial_masks(
+            cluster_offsets, cluster_ids, cluster_length
+        )
+
+        scores, indices = torch.ops.st.fused_kmean_ann_with_partial_masks(
+            cluster_offsets,
+            cluster_ids,
+            cluster_length,
+            embeddings,
+            queries,
+            max_size,
+            col_cumsum,
+            first_offsets,
+            col_masks,
+        )
+        self.assertEqual(scores.size(0), 2)
+        self.assertEqual(indices.size(0), 2)
+        self.assertEqual(scores.dtype, torch.float32)
+        self.assertEqual(indices.dtype, torch.int32)
+
+    def test_gpu_runs(self) -> None:
+        if not HAS_CUDA:
+            self.skipTest("CUDA not available")
+
+        n_clusters = 3
+        cluster_size = 32
+        dim = 64
+        total_docs = n_clusters * cluster_size
+        cluster_offsets = torch.arange(
+            0, total_docs + 1, cluster_size, dtype=torch.long
+        )
+        embeddings = torch.randn(total_docs, dim)
+        queries = torch.randn(2, dim)
+        cluster_ids = torch.tensor([[0, 1], [1, 2]], dtype=torch.long)
+        cluster_length = torch.full((2, 2), cluster_size, dtype=torch.long)
+        max_size = 2 * cluster_size
+
+        col_cumsum, first_offsets, col_masks = self._make_partial_masks(
+            cluster_offsets, cluster_ids, cluster_length, "cuda"
+        )
+
+        scores, indices = torch.ops.st.fused_kmean_ann_with_partial_masks(
+            cluster_offsets.cuda(),
+            cluster_ids.cuda(),
+            cluster_length.cuda(),
+            embeddings.cuda(),
+            queries.cuda(),
+            max_size,
+            col_cumsum,
+            first_offsets,
+            col_masks,
+        )
+        self.assertTrue(scores.is_cuda)
+        self.assertEqual(scores.size(0), 2)
+
+    def test_int8_with_partial_masks(self) -> None:
+        if not HAS_CUDA:
+            self.skipTest("CUDA not available")
+
+        n_clusters = 2
+        cluster_size = 32
+        dim = 64
+        total_docs = n_clusters * cluster_size
+        cluster_offsets = torch.arange(
+            0, total_docs + 1, cluster_size, dtype=torch.long
+        )
+        embeddings = torch.randint(-128, 127, (total_docs, dim), dtype=torch.int8)
+        queries = torch.randint(-128, 127, (1, dim), dtype=torch.int8)
+        cluster_ids = torch.tensor([[0, 1]], dtype=torch.long)
+        cluster_length = torch.full((1, 2), cluster_size, dtype=torch.long)
+        max_size = 2 * cluster_size
+
+        col_cumsum, first_offsets, col_masks = self._make_partial_masks(
+            cluster_offsets, cluster_ids, cluster_length, "cuda"
+        )
+
+        scores, indices = torch.ops.st.fused_kmean_ann_with_partial_masks(
+            cluster_offsets.cuda(),
+            cluster_ids.cuda(),
+            cluster_length.cuda(),
+            embeddings.cuda(),
+            queries.cuda(),
+            max_size,
+            col_cumsum,
+            first_offsets,
+            col_masks,
+            divisor_for_int8=127,
+        )
+        self.assertEqual(scores.dtype, torch.float16)

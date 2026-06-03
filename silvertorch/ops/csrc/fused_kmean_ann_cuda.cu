@@ -440,6 +440,255 @@ std::tuple<Tensor, int64_t> generate_warp_payload(
 
 namespace {
 
+__global__ void generate_warp_payload_with_partial_masks_kernel(
+    const PackedTensorAccessor64<int64_t, 1> cluster_offsets,
+    const PackedTensorAccessor64<int64_t, 2> cluster_ids,
+    const PackedTensorAccessor32<int32_t, 2> cluster_warp_rounded_length_cumsum,
+    const int32_t* assigned_cluster_id_index,
+    const int32_t* cluster_warp_size_cumsum,
+    WarpPayload* warp_payloads,
+    const int32_t* partial_mask_column_counts_cumsum,
+    const int8_t* partial_mask_first_item_offset_in_column,
+    const uint64_t* partial_mask_column_results,
+    const uint64_t* filtering_bitmask_index_ptr,
+    int64_t total_needed_warps,
+    int64_t max_tensor_size_per_row,
+    TORCH_DSA_KERNEL_ARGS) {
+  int64_t clusters_per_row = cluster_ids.size(1);
+
+  for (int64_t process_warp = blockIdx.x * blockDim.x + threadIdx.x;
+       process_warp < total_needed_warps;
+       process_warp += blockDim.x * gridDim.x) {
+    WarpPayload warp_payload;
+    int32_t cluster_id_index = assigned_cluster_id_index[process_warp];
+
+    int32_t row = static_cast<int32_t>(cluster_id_index / clusters_per_row);
+    int64_t cluster_ids_column = cluster_id_index % clusters_per_row;
+    int64_t cluster_id = cluster_ids[row][cluster_ids_column];
+
+    int32_t cluster_start_doc_index =
+        static_cast<int32_t>(cluster_offsets[cluster_id]);
+    int32_t doc_offset_in_cur_cluster = static_cast<int32_t>(
+        (process_warp -
+         ((cluster_id_index == 0)
+              ? 0
+              : cluster_warp_size_cumsum[cluster_id_index - 1])) *
+        kWarpThreadCount);
+    warp_payload.doc_start_index =
+        cluster_start_doc_index + doc_offset_in_cur_cluster;
+
+    warp_payload.write_index = static_cast<int32_t>(
+        row * max_tensor_size_per_row +
+        ((cluster_ids_column == 0)
+             ? 0
+             : cluster_warp_rounded_length_cumsum[row]
+                                                 [cluster_ids_column - 1]) +
+        doc_offset_in_cur_cluster);
+
+    warp_payload.cluster_ids_row = row;
+
+    int32_t mask_row = filtering_bitmask_index_ptr == nullptr
+        ? row
+        : static_cast<int32_t>(*(filtering_bitmask_index_ptr + row));
+    int64_t cluster_index_in_mask =
+        mask_row * clusters_per_row + cluster_ids_column;
+    int64_t cluster_start_mask_column_index = cluster_index_in_mask == 0
+        ? 0
+        : partial_mask_column_counts_cumsum[cluster_index_in_mask - 1];
+    warp_payload.filtering_mask = get_next_32_bit_mask(
+        partial_mask_column_results + cluster_start_mask_column_index,
+        doc_offset_in_cur_cluster +
+            static_cast<int32_t>(partial_mask_first_item_offset_in_column
+                                     [cluster_index_in_mask]));
+    reinterpret_cast<int4*>(warp_payloads)[process_warp] = warp_payload.payload;
+  }
+}
+
+} // namespace
+
+std::tuple<Tensor, int64_t> generate_warp_payload_with_partial_masks(
+    const Tensor& cluster_warp_size,
+    const Tensor& cluster_offsets,
+    const Tensor& cluster_ids,
+    const Tensor& cluster_warp_rounded_length_cumsum,
+    const Tensor& cluster_warp_size_cumsum,
+    int32_t total_warps,
+    const int32_t* partial_mask_column_counts_cumsum,
+    const int8_t* partial_mask_first_item_offset_in_column,
+    const uint64_t* partial_mask_column_results,
+    const uint64_t* filtering_bitmask_index_ptr,
+    int64_t max_tensor_size_per_row) {
+  TORCH_CHECK(cluster_warp_size.dim() == 1);
+  TORCH_CHECK(cluster_warp_rounded_length_cumsum.dim() == 2);
+
+  auto input = torch::arange(
+      cluster_warp_size.numel(), cluster_warp_size.options().dtype(at::kInt));
+  auto assigned_cluster_id_index = input.repeat_interleave(cluster_warp_size);
+
+  auto warp_payloads = at::empty(
+      {assigned_cluster_id_index.numel() *
+       static_cast<int64_t>(sizeof(WarpPayload))},
+      assigned_cluster_id_index.options().dtype(at::kChar),
+      at::MemoryFormat::Contiguous);
+
+  int64_t total_needed_warps = assigned_cluster_id_index.numel();
+  auto grid_size = std::min(
+      (total_needed_warps + kBlockSize - 1) / kBlockSize,
+      128L * at::cuda::getCurrentDeviceProperties()->multiProcessorCount);
+
+  MAYBE_TORCH_DSA_KERNEL_LAUNCH(
+      generate_warp_payload_with_partial_masks_kernel,
+      grid_size,
+      kBlockSize,
+      0,
+      at::cuda::getCurrentCUDAStream(),
+      cluster_offsets.packed_accessor64<int64_t, 1>(),
+      cluster_ids.packed_accessor64<int64_t, 2>(),
+      cluster_warp_rounded_length_cumsum.packed_accessor32<int32_t, 2>(),
+      assigned_cluster_id_index.data_ptr<int32_t>(),
+      cluster_warp_size_cumsum.data_ptr<int32_t>(),
+      reinterpret_cast<WarpPayload*>(warp_payloads.mutable_data_ptr<int8_t>()),
+      partial_mask_column_counts_cumsum,
+      partial_mask_first_item_offset_in_column,
+      partial_mask_column_results,
+      filtering_bitmask_index_ptr,
+      total_needed_warps,
+      max_tensor_size_per_row);
+
+  return std::make_tuple(std::move(warp_payloads), total_needed_warps);
+}
+
+namespace {
+
+__global__ void generate_remaining_payload_with_partial_masks_kernel(
+    const PackedTensorAccessor64<int64_t, 1> cluster_offsets,
+    const PackedTensorAccessor64<int64_t, 2> cluster_ids,
+    const PackedTensorAccessor64<int64_t, 2> cluster_length,
+    const PackedTensorAccessor32<int32_t, 2> cluster_warp_rounded_length_cumsum,
+    const int32_t* cluster_remaining_length_cumsum,
+    RemainingPayload* remaining_payloads,
+    const int32_t* partial_mask_column_counts_cumsum,
+    const int8_t* partial_mask_first_item_offset_in_column,
+    const uint64_t* partial_mask_column_results,
+    const uint64_t* filtering_bitmask_index_ptr,
+    int64_t max_tensor_size_per_row,
+    TORCH_DSA_KERNEL_ARGS) {
+  int64_t cluster_length_column_count = cluster_length.size(1);
+  int64_t cluster_length_size =
+      cluster_length.size(0) * cluster_length_column_count;
+
+  for (int64_t process_index = blockIdx.x * blockDim.x + threadIdx.x;
+       process_index < cluster_length_size;
+       process_index += blockDim.x * gridDim.x) {
+    int32_t row =
+        static_cast<int32_t>(process_index / cluster_length_column_count);
+    int32_t column =
+        static_cast<int32_t>(process_index % cluster_length_column_count);
+    int32_t cur_cluster_length =
+        static_cast<int32_t>(cluster_length[row][column]);
+    int32_t needed_warp_count = cur_cluster_length / kWarpThreadCount;
+    int32_t already_handled_docs = needed_warp_count * kWarpThreadCount;
+
+    int64_t cluster_id = cluster_ids[row][column];
+    int32_t cluster_id_start_index =
+        static_cast<int32_t>(cluster_offsets[cluster_id]);
+    int32_t doc_idex_start = cluster_id_start_index + already_handled_docs;
+    int32_t remaining_docs = cur_cluster_length - already_handled_docs;
+
+    int32_t remaining_payloads_offset = (process_index == 0)
+        ? 0
+        : cluster_remaining_length_cumsum[process_index - 1];
+
+    int32_t last_row_all_remaining =
+        ((row == 0) ? 0
+                    : cluster_remaining_length_cumsum
+                          [row * cluster_length_column_count - 1]);
+    int32_t remaining_payloads_offset_in_row =
+        (remaining_payloads_offset - last_row_all_remaining);
+    int32_t write_index_offset =
+        row * static_cast<int32_t>(max_tensor_size_per_row);
+    write_index_offset +=
+        cluster_warp_rounded_length_cumsum[row]
+                                          [cluster_length_column_count - 1];
+    write_index_offset += remaining_payloads_offset_in_row;
+
+    int32_t mask_row = filtering_bitmask_index_ptr == nullptr
+        ? row
+        : static_cast<int32_t>(*(filtering_bitmask_index_ptr + row));
+    int64_t cluster_index_in_mask =
+        mask_row * cluster_length_column_count + column;
+    int64_t cluster_start_mask_column_index = cluster_index_in_mask == 0
+        ? 0
+        : partial_mask_column_counts_cumsum[cluster_index_in_mask - 1];
+    int32_t mask_column_offset =
+        already_handled_docs +
+        static_cast<int32_t>(
+            partial_mask_first_item_offset_in_column[cluster_index_in_mask]);
+    for (int32_t i = 0; i < remaining_docs; ++i) {
+      RemainingPayload remaining_payload;
+      remaining_payload.doc_index = doc_idex_start + i;
+      remaining_payload.cluster_ids_row = row;
+      remaining_payload.write_index = write_index_offset + i;
+      remaining_payload.filtering_mask = get_bit_64_bit_mask(
+          partial_mask_column_results + cluster_start_mask_column_index,
+          mask_column_offset + i);
+      reinterpret_cast<int4*>(
+          remaining_payloads)[remaining_payloads_offset + i] =
+          remaining_payload.payload;
+    }
+  }
+}
+
+} // namespace
+
+std::tuple<Tensor, int64_t> generate_remaining_payload_with_partial_masks(
+    const Tensor& cluster_length,
+    const Tensor& cluster_offsets,
+    const Tensor& cluster_ids,
+    const Tensor& cluster_warp_rounded_length_cumsum,
+    const Tensor& cluster_remaining_length_cumsum,
+    int32_t remaining_docs,
+    const int32_t* partial_mask_column_counts_cumsum,
+    const int8_t* partial_mask_first_item_offset_in_column,
+    const uint64_t* partial_mask_column_results,
+    const uint64_t* filtering_bitmask_index_ptr,
+    int64_t max_tensor_size_per_row) {
+  TORCH_CHECK(cluster_warp_rounded_length_cumsum.dim() == 2);
+  TORCH_CHECK(cluster_remaining_length_cumsum.dim() == 1);
+
+  auto remaining_payloads = at::empty(
+      {remaining_docs * static_cast<int64_t>(sizeof(RemainingPayload))},
+      cluster_length.options().dtype(at::kChar),
+      at::MemoryFormat::Contiguous);
+
+  auto grid_size = std::min(
+      (cluster_length.numel() + kBlockSize - 1) / kBlockSize,
+      128L * at::cuda::getCurrentDeviceProperties()->multiProcessorCount);
+
+  TORCH_DSA_KERNEL_LAUNCH(
+      generate_remaining_payload_with_partial_masks_kernel,
+      grid_size,
+      kBlockSize,
+      0,
+      at::cuda::getCurrentCUDAStream(),
+      cluster_offsets.packed_accessor64<int64_t, 1>(),
+      cluster_ids.packed_accessor64<int64_t, 2>(),
+      cluster_length.packed_accessor64<int64_t, 2>(),
+      cluster_warp_rounded_length_cumsum.packed_accessor32<int32_t, 2>(),
+      cluster_remaining_length_cumsum.data_ptr<int32_t>(),
+      reinterpret_cast<RemainingPayload*>(
+          remaining_payloads.mutable_data_ptr<int8_t>()),
+      partial_mask_column_counts_cumsum,
+      partial_mask_first_item_offset_in_column,
+      partial_mask_column_results,
+      filtering_bitmask_index_ptr,
+      max_tensor_size_per_row);
+
+  return std::make_tuple(std::move(remaining_payloads), remaining_docs);
+}
+
+namespace {
+
 template <bool FILTER>
 __inline__ __device__ bool get_filtering_mask(
     uint32_t /* filtering_mask */,
@@ -1117,10 +1366,192 @@ std::tuple<Tensor, Tensor> fused_kmean_ann_cuda(
       /*query_on_shared_mem=*/false);
 }
 
+std::tuple<Tensor, Tensor> fused_kmean_ann_cuda_with_partial_masks(
+    const Tensor& cluster_offsets,
+    const Tensor& cluster_ids,
+    const Tensor& cluster_length,
+    const Tensor& embeddings,
+    const Tensor& queries,
+    int64_t max_tensor_size_per_row,
+    const Tensor& partial_mask_column_counts_cumsum,
+    const Tensor& partial_mask_first_item_offset_in_column,
+    const Tensor& partial_mask_column_results,
+    int64_t invalid_index_value,
+    int64_t divisor_for_int8,
+    const std::optional<Tensor>& filtering_bit_index,
+    const std::optional<Tensor>& per_embedding_scale,
+    const std::optional<Tensor>& cluster_warp_size_opt,
+    const std::optional<Tensor>& cluster_warp_rounded_length_cumsum_opt,
+    const std::optional<Tensor>& cluster_remaining_length_cumsum_opt,
+    const std::optional<Tensor>& cluster_warp_size_cumsum_opt,
+    int64_t total_cluster_rounded_warps,
+    int64_t total_cluster_remaining_warps) {
+  TORCH_CHECK(cluster_offsets.is_cuda());
+  TORCH_CHECK(cluster_offsets.is_contiguous());
+  TORCH_CHECK(cluster_offsets.dim() == 1);
+
+  TORCH_CHECK(cluster_ids.is_cuda());
+  TORCH_CHECK(cluster_ids.is_contiguous());
+  TORCH_CHECK(cluster_ids.dim() == 2);
+
+  TORCH_CHECK(cluster_length.is_cuda());
+  TORCH_CHECK(cluster_length.is_contiguous());
+  TORCH_CHECK(cluster_length.dim() == 2);
+
+  TORCH_CHECK(embeddings.is_cuda());
+  TORCH_CHECK(embeddings.is_contiguous());
+  TORCH_CHECK(embeddings.dim() == 2);
+
+  TORCH_CHECK(queries.is_cuda());
+  TORCH_CHECK(queries.is_contiguous());
+  TORCH_CHECK(queries.dim() == 2);
+
+  TORCH_CHECK(cluster_ids.size(0) == cluster_length.size(0));
+  TORCH_CHECK(cluster_ids.size(0) == queries.size(0));
+  TORCH_CHECK(cluster_ids.size(1) == cluster_length.size(1));
+  TORCH_CHECK(embeddings.size(1) == queries.size(1));
+
+  TORCH_CHECK(partial_mask_column_counts_cumsum.is_cuda());
+  TORCH_CHECK(partial_mask_first_item_offset_in_column.is_cuda());
+  TORCH_CHECK(partial_mask_column_results.is_cuda());
+  TORCH_CHECK(partial_mask_column_counts_cumsum.dim() == 1);
+  TORCH_CHECK(partial_mask_first_item_offset_in_column.dim() == 1);
+  TORCH_CHECK(partial_mask_column_results.dim() == 1);
+  TORCH_CHECK(partial_mask_column_results.scalar_type() == at::kLong);
+  TORCH_CHECK(partial_mask_column_results.is_contiguous());
+  TORCH_CHECK(
+      partial_mask_column_counts_cumsum.size(0) ==
+      partial_mask_first_item_offset_in_column.size(0));
+
+  const int32_t* partial_mask_column_counts_cumsum_ptr =
+      partial_mask_column_counts_cumsum.data_ptr<int32_t>();
+  const int8_t* partial_mask_first_item_offset_in_column_ptr =
+      partial_mask_first_item_offset_in_column.data_ptr<int8_t>();
+  const uint64_t* partial_mask_column_results_ptr =
+      reinterpret_cast<const uint64_t*>(
+          partial_mask_column_results.data_ptr<int64_t>());
+
+  const uint64_t* filtering_bitmask_index_ptr = nullptr;
+  if (filtering_bit_index) {
+    TORCH_CHECK(filtering_bit_index->is_cuda());
+    TORCH_CHECK(filtering_bit_index->size(0) == cluster_ids.size(0));
+    TORCH_CHECK(filtering_bit_index->dim() == 1);
+    filtering_bitmask_index_ptr = reinterpret_cast<const uint64_t*>(
+        filtering_bit_index->data_ptr<int64_t>());
+  } else {
+    TORCH_CHECK(
+        partial_mask_first_item_offset_in_column.size(0) ==
+        cluster_ids.numel());
+  }
+
+  if (per_embedding_scale.has_value()) {
+    TORCH_CHECK(per_embedding_scale->is_cuda());
+    TORCH_CHECK(per_embedding_scale->is_contiguous());
+    TORCH_CHECK(per_embedding_scale->dim() == 1);
+    TORCH_CHECK(per_embedding_scale->size(0) == embeddings.size(0));
+    TORCH_CHECK(per_embedding_scale->scalar_type() == at::kHalf);
+  }
+
+  max_tensor_size_per_row = (max_tensor_size_per_row + kWarpThreadCount - 1) /
+      kWarpThreadCount * kWarpThreadCount;
+
+  at::cuda::OptionalCUDAGuard device_guard;
+  device_guard.set_index(cluster_ids.get_device());
+
+  Tensor cluster_warp_size_tensor;
+  Tensor cluster_warp_rounded_length_cumsum_tensor;
+  Tensor cluster_remaining_length_cumsum_tensor;
+  Tensor cluster_warp_size_cumsum_tensor;
+
+  if (cluster_warp_size_opt.has_value() &&
+      cluster_warp_rounded_length_cumsum_opt.has_value() &&
+      cluster_remaining_length_cumsum_opt.has_value() &&
+      cluster_warp_size_cumsum_opt.has_value()) {
+    cluster_warp_size_tensor = cluster_warp_size_opt.value();
+    cluster_warp_rounded_length_cumsum_tensor =
+        cluster_warp_rounded_length_cumsum_opt.value();
+    cluster_remaining_length_cumsum_tensor =
+        cluster_remaining_length_cumsum_opt.value();
+    cluster_warp_size_cumsum_tensor = cluster_warp_size_cumsum_opt.value();
+  } else {
+    auto
+        [cluster_warp_size_computed,
+         cluster_warp_rounded_length,
+         cluster_remaining_length] = round_cluster_to_warp(cluster_length);
+
+    TORCH_CHECK(cluster_warp_rounded_length.dim() == 2);
+    TORCH_CHECK(cluster_remaining_length.dim() == 1);
+    cluster_warp_size_tensor = cluster_warp_size_computed;
+    cluster_warp_rounded_length_cumsum_tensor =
+        cluster_warp_rounded_length.cumsum(/*dim=*/1, /*dtype=*/at::kInt);
+    cluster_remaining_length_cumsum_tensor =
+        cluster_remaining_length.cumsum(/*dim=*/0, /*dtype=*/at::kInt);
+    cluster_warp_size_cumsum_tensor =
+        cluster_warp_size_tensor.cumsum(/*dim=*/0, /*dtype=*/at::kInt);
+  }
+
+  int32_t total_warps_computed = (total_cluster_rounded_warps > 0)
+      ? total_cluster_rounded_warps
+      : cluster_warp_size_cumsum_tensor[-1].item<int32_t>();
+
+  auto [warp_payloads, total_needed_warps] =
+      generate_warp_payload_with_partial_masks(
+          cluster_warp_size_tensor,
+          cluster_offsets,
+          cluster_ids,
+          cluster_warp_rounded_length_cumsum_tensor,
+          cluster_warp_size_cumsum_tensor,
+          total_warps_computed,
+          partial_mask_column_counts_cumsum_ptr,
+          partial_mask_first_item_offset_in_column_ptr,
+          partial_mask_column_results_ptr,
+          filtering_bitmask_index_ptr,
+          max_tensor_size_per_row);
+
+  int32_t total_remaining_docs_computed = (total_cluster_remaining_warps > 0)
+      ? total_cluster_remaining_warps
+      : cluster_remaining_length_cumsum_tensor[-1].item<int32_t>();
+  auto [remaining_payloads, remaining_docs] =
+      generate_remaining_payload_with_partial_masks(
+          cluster_length,
+          cluster_offsets,
+          cluster_ids,
+          cluster_warp_rounded_length_cumsum_tensor,
+          cluster_remaining_length_cumsum_tensor,
+          total_remaining_docs_computed,
+          partial_mask_column_counts_cumsum_ptr,
+          partial_mask_first_item_offset_in_column_ptr,
+          partial_mask_column_results_ptr,
+          filtering_bitmask_index_ptr,
+          max_tensor_size_per_row);
+
+  return fused_kmean_ann_run_payloads(
+      cluster_ids,
+      embeddings,
+      queries,
+      max_tensor_size_per_row,
+      invalid_index_value,
+      divisor_for_int8,
+      true,
+      warp_payloads,
+      total_needed_warps,
+      remaining_payloads,
+      remaining_docs,
+      per_embedding_scale);
+}
+
 TORCH_LIBRARY_IMPL(st, CUDA, m) {
   m.impl(
       "fused_kmean_ann",
       torch::dispatch(c10::DispatchKey::CUDA, TORCH_FN(fused_kmean_ann_cuda)));
+}
+
+TORCH_LIBRARY_IMPL(st, CUDA, m) {
+  m.impl(
+      "fused_kmean_ann_with_partial_masks",
+      torch::dispatch(
+          c10::DispatchKey::CUDA,
+          TORCH_FN(fused_kmean_ann_cuda_with_partial_masks)));
 }
 
 } // namespace st::ops::fused_kmean_ann
