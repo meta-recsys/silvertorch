@@ -242,6 +242,137 @@ Tensor bloom_index_search_common_cpu(
   return document_mask;
 }
 
+std::tuple<Tensor, Tensor, Tensor>
+bloom_index_search_common_return_partial_response(
+    const Tensor& bloom_index,
+    const Tensor& bloom_bundle_b_offsets,
+    const Tensor& bloom_query_plans_data,
+    const Tensor& bloom_query_plans_offsets,
+    const Tensor& selected_cluster_offsets,
+    const Tensor& selected_cluster_lengths,
+    int64_t k,
+    int64_t hash_k,
+    const std::optional<Tensor>& query_plan_index) {
+  TORCH_CHECK(bloom_index.is_contiguous(), "bloom_index must be contiguous");
+  TORCH_CHECK(
+      bloom_index.scalar_type() == at::ScalarType::Long,
+      "bloom_index dtype must be Long");
+  TORCH_CHECK(
+      selected_cluster_offsets.dim() == 2,
+      "selected_cluster_offsets dim must be 2, but got ",
+      selected_cluster_offsets.dim());
+  TORCH_CHECK(
+      selected_cluster_lengths.dim() == 2,
+      "selected_cluster_lengths dim must be 2, but got ",
+      selected_cluster_lengths.dim());
+  TORCH_CHECK(
+      selected_cluster_offsets.dtype() == at::kLong,
+      "selected_cluster_offsets dtype must be Long");
+  TORCH_CHECK(
+      selected_cluster_lengths.dtype() == at::kLong,
+      "selected_cluster_lengths dtype must be Long");
+  int64_t query_count = selected_cluster_offsets.size(0);
+  int64_t cluster_count = selected_cluster_offsets.size(1);
+  TORCH_CHECK(
+      query_count == selected_cluster_lengths.size(0) &&
+          selected_cluster_offsets.size(1) == selected_cluster_lengths.size(1),
+      "selected_cluster_offsets must have same shape with selected_cluster_lengths, but got ",
+      selected_cluster_offsets.sizes(),
+      " vs ",
+      selected_cluster_lengths.sizes());
+  const uint64_t* query_plan_index_ptr = nullptr;
+  if (query_plan_index) {
+    TORCH_CHECK(
+        query_plan_index->dim() == 1,
+        "query_plan_index dim must be 1, but got ",
+        query_plan_index->dim());
+    TORCH_CHECK(
+        query_plan_index->size(0) == query_count,
+        "query_plan count must be same with selected_cluster size[0], but got ",
+        query_plan_index->size(0),
+        " vs ",
+        query_count);
+    query_plan_index_ptr = reinterpret_cast<const uint64_t*>(
+        query_plan_index->data_ptr<int64_t>());
+  } else {
+    int64_t query_plan_count = (bloom_query_plans_offsets.numel()) / 8;
+    TORCH_CHECK(
+        query_plan_count == query_count,
+        "query_plan_count must be equal to query_count if no query_plan_index, but got ",
+        query_plan_count,
+        " vs ",
+        query_count);
+  }
+
+  TORCH_CHECK(bloom_index.dim() == 1, "bloom_index dim must be 1 for v2");
+  TORCH_CHECK(
+      bloom_bundle_b_offsets.is_contiguous(),
+      "bloom_bundle_b_offsets must be contiguous");
+  const int64_t* bundle_b_offsets = bloom_bundle_b_offsets.data_ptr<int64_t>();
+  int64_t total_column_count =
+      (bloom_bundle_b_offsets.numel() - 1) * C_BLOOM_V2_COL_BUNDLE_SIZE;
+
+  const int64_t* selected_cluster_offsets_ptr =
+      selected_cluster_offsets.data_ptr<int64_t>();
+  const int64_t* selected_cluster_lengths_ptr =
+      selected_cluster_lengths.data_ptr<int64_t>();
+  const int64_t* bloom_index_ptr = bloom_index.data_ptr<int64_t>();
+
+  std::vector<int64_t> column_mask_response_vec;
+  std::vector<int8_t> offset_in_col_vec;
+  std::vector<int32_t> column_counts_cumsum_vec;
+  int32_t column_count_acc = 0;
+  for (int64_t q = 0; q < query_count; ++q) {
+    for (int64_t c = 0; c < cluster_count; ++c) {
+      int64_t start = selected_cluster_offsets_ptr[q * cluster_count + c];
+      int64_t length = selected_cluster_lengths_ptr[q * cluster_count + c];
+      int8_t offset_in_col = static_cast<int8_t>(start % C_BITS_IN_UINT64);
+      offset_in_col_vec.push_back(offset_in_col);
+      int32_t start_col_id = static_cast<int32_t>(start / C_BITS_IN_UINT64);
+      int32_t column_count_per_cluster =
+          (length > 0 ? static_cast<int32_t>(
+                            (length + offset_in_col + C_BITS_IN_UINT64 - 1) /
+                            C_BITS_IN_UINT64)
+                      : 0);
+      column_count_acc += column_count_per_cluster;
+      column_counts_cumsum_vec.push_back(column_count_acc);
+      int32_t end_col_id = start_col_id + column_count_per_cluster;
+      for (int64_t column_id = start_col_id; column_id < end_col_id;
+           ++column_id) {
+        uint64_t column_result = run_query_plan(
+            bloom_index_ptr,
+            total_column_count,
+            bundle_b_offsets,
+            column_id,
+            k,
+            hash_k,
+            bloom_query_plans_data,
+            bloom_query_plans_offsets,
+            query_plan_index_ptr == nullptr ? q : query_plan_index_ptr[q],
+            /*is_bloom_index_v2*/ true);
+        column_mask_response_vec.push_back(
+            *(reinterpret_cast<int64_t*>(&column_result)));
+      }
+    }
+  }
+  return std::make_tuple(
+      torch::from_blob(
+          column_counts_cumsum_vec.data(),
+          {static_cast<int32_t>(column_counts_cumsum_vec.size())},
+          at::kInt)
+          .clone(),
+      torch::from_blob(
+          offset_in_col_vec.data(),
+          {static_cast<int32_t>(offset_in_col_vec.size())},
+          at::kChar)
+          .clone(),
+      torch::from_blob(
+          column_mask_response_vec.data(),
+          {static_cast<int32_t>(column_mask_response_vec.size())},
+          at::kLong)
+          .clone());
+}
+
 } // namespace
 
 Tensor bloom_index_search_batch_cpu(
@@ -261,6 +392,29 @@ Tensor bloom_index_search_batch_cpu(
       hash_k,
       return_bool_mask,
       /*is_bloom_index_v2*/ true);
+}
+
+std::tuple<Tensor, Tensor, Tensor>
+bloom_index_search_batch_return_partial_response_cpu(
+    const Tensor& bloom_index,
+    const Tensor& bloom_bundle_b_offsets,
+    const Tensor& bloom_query_plans_data,
+    const Tensor& bloom_query_plans_offsets,
+    const Tensor& selected_cluster_offsets,
+    const Tensor& selected_cluster_lengths,
+    int64_t k,
+    int64_t hash_k,
+    const std::optional<Tensor>& query_plan_index) {
+  return bloom_index_search_common_return_partial_response(
+      bloom_index,
+      bloom_bundle_b_offsets,
+      bloom_query_plans_data,
+      bloom_query_plans_offsets,
+      selected_cluster_offsets,
+      selected_cluster_lengths,
+      k,
+      hash_k,
+      query_plan_index);
 }
 
 static std::tuple<Tensor, Tensor, Tensor> generate_column_info_for_clusters_cpu(
@@ -333,6 +487,19 @@ TORCH_LIBRARY_FRAGMENT(st, m) {
       "int hash_k, "
       "bool return_bool_mask=True)"
       "-> Tensor");
+
+  m.def(
+      "bloom_index_search_batch_return_partial_response("
+      "Tensor bloom_index, "
+      "Tensor bloom_bundle_b_offsets, "
+      "Tensor bloom_query_plans_data, "
+      "Tensor bloom_query_plans_offsets, "
+      "Tensor selected_cluster_offsets, "
+      "Tensor selected_cluster_lengths, "
+      "int k, "
+      "int hash_k, "
+      "Tensor? query_plan_index=None)"
+      "-> (Tensor, Tensor, Tensor)");
 }
 
 TORCH_LIBRARY_IMPL(st, CPU, m) {
@@ -340,6 +507,14 @@ TORCH_LIBRARY_IMPL(st, CPU, m) {
       "bloom_index_search_batch",
       torch::dispatch(
           c10::DispatchKey::CPU, TORCH_FN(bloom_index_search_batch_cpu)));
+}
+
+TORCH_LIBRARY_IMPL(st, CPU, m) {
+  m.impl(
+      "bloom_index_search_batch_return_partial_response",
+      torch::dispatch(
+          c10::DispatchKey::CPU,
+          TORCH_FN(bloom_index_search_batch_return_partial_response_cpu)));
 }
 
 TORCH_LIBRARY_IMPL(st, CPU, m) {

@@ -27,4 +27,16 @@ at::Tensor bloom_index_search_batch_cpu(
     int64_t hash_k,
     bool return_bool_mask);
 
+std::tuple<at::Tensor, at::Tensor, at::Tensor>
+bloom_index_search_batch_return_partial_response_cpu(
+    const at::Tensor& bloom_index,
+    const at::Tensor& bloom_bundle_b_offsets,
+    const at::Tensor& bloom_query_plans_data,
+    const at::Tensor& bloom_query_plans_offsets,
+    const at::Tensor& selected_cluster_offsets,
+    const at::Tensor& selected_cluster_lengths,
+    int64_t k,
+    int64_t hash_k,
+    const std::optional<at::Tensor>& query_plan_index);
+
 } // namespace st::ops::bloom_search

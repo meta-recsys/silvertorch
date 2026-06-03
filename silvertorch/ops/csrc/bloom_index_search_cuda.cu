@@ -644,7 +644,115 @@ __global__ void generate_column_info_for_clusters_kernel(
   }
 }
 
+template <int32_t STACK_SIZE, bool is_bloom_index_v2>
+__global__ void process_documents_on_assigned_cluster_columns_kernel(
+    const int64_t* __restrict__ bloom_index,
+    const int64_t index_total_column_count,
+    const int64_t* __restrict__ bundle_b_offsets,
+    const PackedTensorAccessor64<int32_t, 1> column_assigned_cluster_index,
+    const PackedTensorAccessor64<int32_t, 1> column_counts_cumsum,
+    const PackedTensorAccessor64<int32_t, 1> start_column_ids,
+    int64_t cluster_count_per_query,
+    PackedTensorAccessor64<int64_t, 1> column_mask_response,
+    const QueryPlanCuda<is_bloom_index_v2>* __restrict__ query_plan,
+    int64_t k,
+    int64_t p_k,
+    const uint64_t* __restrict__ query_plan_index_ptr,
+    TORCH_DSA_KERNEL_ARGS) {
+  int64_t total_column_count = column_assigned_cluster_index.size(0);
+  for (int64_t column_index =
+           static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+       column_index < total_column_count;
+       column_index += static_cast<int64_t>(blockDim.x) * gridDim.x) {
+    int64_t assigned_cluster_index =
+        column_assigned_cluster_index[column_index];
+    int64_t query_id = assigned_cluster_index / cluster_count_per_query;
+    query_id = query_plan_index_ptr == nullptr
+        ? query_id
+        : static_cast<int64_t>(query_plan_index_ptr[query_id]);
+    int64_t col_idx_in_local_cluster = column_index -
+        (assigned_cluster_index == 0
+             ? 0
+             : column_counts_cumsum[assigned_cluster_index - 1]);
+    int64_t column_id =
+        start_column_ids[assigned_cluster_index] + col_idx_in_local_cluster;
+    uint64_t result = run_query_plan<STACK_SIZE, is_bloom_index_v2>(
+        bloom_index,
+        index_total_column_count,
+        bundle_b_offsets,
+        column_id,
+        k,
+        p_k,
+        query_plan[query_id]);
+    store<int64_t>(column_mask_response.data() + column_index, result, 0);
+  }
+}
+
 } // namespace
+
+template <bool is_bloom_index_v2>
+Tensor process_documents_on_assigned_cluster_columns(
+    const Tensor& bloom_index,
+    const Tensor* bloom_bundle_b_offsets,
+    const Tensor& column_assigned_cluster_index,
+    const Tensor& column_counts_cumsum,
+    const Tensor& start_column_ids,
+    int64_t cluster_count_per_query,
+    const QueryPlanCuda<is_bloom_index_v2>* query_plan,
+    int64_t k,
+    int64_t onebit_position_k,
+    int32_t query_plans_max_stack_size,
+    const uint64_t* query_plan_index_ptr) {
+  int64_t* bundle_b_offsets_ptr = nullptr;
+  int64_t index_total_column_count;
+  if constexpr (is_bloom_index_v2) {
+    TORCH_CHECK(bloom_bundle_b_offsets != nullptr);
+    bundle_b_offsets_ptr = bloom_bundle_b_offsets->data_ptr<int64_t>();
+    index_total_column_count =
+        (bloom_bundle_b_offsets->numel() - 1) * C_BLOOM_V2_COL_BUNDLE_SIZE;
+  } else {
+    index_total_column_count = bloom_index.size(1);
+  }
+  constexpr int64_t kThreads = 256L;
+  int64_t kBlocks = 128L *
+      CHECK_NOTNULL(at::cuda::getCurrentDeviceProperties())
+          ->multiProcessorCount;
+  int64_t total_column_count = column_assigned_cluster_index.numel();
+  int64_t block_size = kThreads;
+  int64_t grid_size =
+      std::min(kBlocks, (total_column_count + block_size - 1) / block_size);
+  Tensor column_mask_response = at::zeros(
+      {total_column_count},
+      c10::TensorOptions().dtype(at::kLong).device(bloom_index.device()));
+#define LAUNCH_KERNEL_WITH_STACK_SIZE(STACK_SIZE)                    \
+  TORCH_DSA_KERNEL_LAUNCH(                                           \
+      (process_documents_on_assigned_cluster_columns_kernel<         \
+          STACK_SIZE,                                                \
+          is_bloom_index_v2>),                                       \
+      grid_size,                                                     \
+      block_size,                                                    \
+      0,                                                             \
+      at::cuda::getCurrentCUDAStream(),                              \
+      bloom_index.data_ptr<int64_t>(),                               \
+      index_total_column_count,                                      \
+      bundle_b_offsets_ptr,                                          \
+      column_assigned_cluster_index.packed_accessor64<int32_t, 1>(), \
+      column_counts_cumsum.packed_accessor64<int32_t, 1>(),          \
+      start_column_ids.packed_accessor64<int32_t, 1>(),              \
+      cluster_count_per_query,                                       \
+      column_mask_response.packed_accessor64<int64_t, 1>(),          \
+      query_plan,                                                    \
+      k,                                                             \
+      onebit_position_k,                                             \
+      query_plan_index_ptr);
+  if (query_plans_max_stack_size <= C_FAST_ROUTE_STACK_SIZE_FIRST_LEVEL) {
+    LAUNCH_KERNEL_WITH_STACK_SIZE(C_FAST_ROUTE_STACK_SIZE_FIRST_LEVEL);
+  } else {
+    LAUNCH_KERNEL_WITH_STACK_SIZE(0);
+  }
+#undef LAUNCH_KERNEL_WITH_STACK_SIZE
+  return column_mask_response;
+}
 
 std::tuple<Tensor, Tensor, Tensor> generate_column_info_for_clusters(
     const Tensor& selected_cluster_offsets,
@@ -861,6 +969,121 @@ Tensor bloom_index_search_batch_cuda(
       return_bool_mask);
 }
 
+std::tuple<Tensor, Tensor, Tensor>
+bloom_index_search_batch_return_partial_response_cuda(
+    const Tensor& bloom_index,
+    const Tensor& bloom_bundle_b_offsets,
+    const Tensor& bloom_query_plans_data,
+    const Tensor& bloom_query_plans_offsets,
+    const Tensor& selected_cluster_offsets,
+    const Tensor& selected_cluster_lengths,
+    int64_t k,
+    int64_t onebit_hash_k,
+    const std::optional<Tensor>& query_plan_index) {
+  TORCH_CHECK(bloom_index.is_cuda());
+  TORCH_CHECK(bloom_index.dim() == 1);
+  TORCH_CHECK(bloom_index.is_contiguous());
+  TORCH_CHECK(selected_cluster_offsets.is_cuda());
+  TORCH_CHECK(selected_cluster_lengths.is_cuda());
+
+  auto plans_data_cpu = bloom_query_plans_data.cpu();
+  auto plans_offsets_cpu = bloom_query_plans_offsets.cpu();
+
+  int64_t query_plans_size = plans_offsets_cpu.numel() / 8;
+  TensorCreationVisitor<true> tensor_creation_visitor(bloom_index.device());
+
+  std::vector<QueryPlan<true>> query_plans;
+  for (int64_t i = 0; i < query_plans_size; ++i) {
+    Tensor operators_t, offsets_t, parameters_t, oneBitsPosition_t;
+    decode_query_plan<true>(
+        plans_data_cpu,
+        plans_offsets_cpu,
+        i * 8,
+        operators_t,
+        offsets_t,
+        parameters_t,
+        oneBitsPosition_t);
+    QueryPlan<true> plan;
+    plan.operators.clear();
+    plan.offsets.clear();
+    auto* ops_ptr = operators_t.data_ptr<uint8_t>();
+    for (int64_t j = 0; j < operators_t.numel(); ++j) {
+      plan.operators.push_back(static_cast<Operator>(ops_ptr[j]));
+    }
+    auto* offsets_ptr = offsets_t.data_ptr<int32_t>();
+    for (int64_t j = 0; j < offsets_t.numel(); ++j) {
+      plan.offsets.push_back(offsets_ptr[j]);
+    }
+    auto* params_ptr = parameters_t.data_ptr<int32_t>();
+    for (int64_t j = 0; j < parameters_t.numel(); ++j) {
+      plan.parameters.push_back(params_ptr[j]);
+    }
+    auto* onebits_ptr =
+        reinterpret_cast<const uint64_t*>(oneBitsPosition_t.data_ptr());
+    for (int64_t j = 0; j < oneBitsPosition_t.numel(); ++j) {
+      plan.oneBitsPosition.push_back(onebits_ptr[j]);
+    }
+    query_plans.push_back(std::move(plan));
+  }
+
+  int32_t query_plans_max_stack_size = get_max_stack_size<true>(query_plans);
+  for (int64_t i = 0; i < query_plans_size; ++i) {
+    tensor_creation_visitor.add_size_and_data(query_plans[i]);
+  }
+  tensor_creation_visitor.add_size_without_data(
+      query_plans_size * sizeof(QueryPlanCuda<true>));
+
+  std::vector<QueryPlanCuda<true>> query_plan_cudas_host;
+  for (int64_t i = 0; i < query_plans_size; ++i) {
+    query_plan_cudas_host.push_back(
+        tensor_creation_visitor.visit(query_plans[i]));
+  }
+  const QueryPlanCuda<true>* query_plan_cuda =
+      tensor_creation_visitor.visit_with_data(query_plan_cudas_host);
+
+  const uint64_t* query_plan_index_ptr = nullptr;
+  if (query_plan_index) {
+    TORCH_CHECK(query_plan_index->size(0) == selected_cluster_lengths.size(0));
+    TORCH_CHECK(query_plan_index->is_cuda());
+    TORCH_CHECK(query_plan_index->dim() == 1);
+    query_plan_index_ptr = reinterpret_cast<const uint64_t*>(
+        query_plan_index->data_ptr<int64_t>());
+  }
+
+  at::cuda::OptionalCUDAGuard device_guard;
+  device_guard.set_index(bloom_index.get_device());
+
+  auto [column_counts, start_column_ids, first_item_offsets_in_column] =
+      generate_column_info_for_clusters(
+          selected_cluster_offsets, selected_cluster_lengths);
+
+  Tensor assigned_cluster_index_tensor =
+      torch::arange(
+          selected_cluster_lengths.numel(),
+          selected_cluster_lengths.options().dtype(at::kInt))
+          .repeat_interleave(column_counts);
+  Tensor column_counts_cumsum_tensor =
+      column_counts.cumsum(/*dim=*/0, /*dtype=*/at::kInt);
+
+  Tensor column_mask_response =
+      process_documents_on_assigned_cluster_columns<true>(
+          bloom_index,
+          &bloom_bundle_b_offsets,
+          assigned_cluster_index_tensor,
+          column_counts_cumsum_tensor,
+          start_column_ids,
+          selected_cluster_lengths.size(1),
+          query_plan_cuda,
+          k,
+          onebit_hash_k,
+          query_plans_max_stack_size,
+          query_plan_index_ptr);
+  return std::make_tuple(
+      std::move(column_counts_cumsum_tensor),
+      std::move(first_item_offsets_in_column),
+      std::move(column_mask_response));
+}
+
 static std::tuple<Tensor, Tensor, Tensor>
 generate_column_info_for_clusters_cuda(
     const Tensor& selected_cluster_offsets,
@@ -888,6 +1111,14 @@ TORCH_LIBRARY_IMPL(st, CUDA, m) {
       "bloom_index_search_batch",
       torch::dispatch(
           c10::DispatchKey::CUDA, TORCH_FN(bloom_index_search_batch_cuda)));
+}
+
+TORCH_LIBRARY_IMPL(st, CUDA, m) {
+  m.impl(
+      "bloom_index_search_batch_return_partial_response",
+      torch::dispatch(
+          c10::DispatchKey::CUDA,
+          TORCH_FN(bloom_index_search_batch_return_partial_response_cuda)));
 }
 } // namespace bloom_search
 } // namespace ops
