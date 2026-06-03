@@ -226,6 +226,40 @@ static std::tuple<Tensor, Tensor> fused_kmean_ann_cpu(
   return std::make_tuple(std::move(scores), std::move(indices));
 }
 
+static std::tuple<Tensor, Tensor> fused_kmean_ann_cpu_with_partial_masks(
+    const Tensor& cluster_offsets,
+    const Tensor& cluster_ids,
+    const Tensor& cluster_length,
+    const Tensor& embeddings,
+    const Tensor& queries,
+    int64_t max_tensor_size_per_row,
+    const Tensor& /* partial_mask_column_counts_cumsum */,
+    const Tensor& /* partial_mask_first_item_offset_in_column */,
+    const Tensor& /* partial_mask_column_results */,
+    int64_t invalid_index_value,
+    int64_t divisor_for_int8,
+    const std::optional<Tensor>& /* filtering_bit_index */,
+    const std::optional<Tensor>& per_embedding_scale,
+    const std::optional<Tensor>& /* cluster_warp_size */,
+    const std::optional<Tensor>& /* cluster_warp_rounded_length_cumsum */,
+    const std::optional<Tensor>& /* cluster_remaining_length_cumsum */,
+    const std::optional<Tensor>& /* cluster_warp_size_cumsum */,
+    int64_t /* total_cluster_rounded_warps */,
+    int64_t /* total_cluster_remaining_warps */) {
+  return fused_kmean_ann_cpu(
+      cluster_offsets,
+      cluster_ids,
+      cluster_length,
+      embeddings,
+      queries,
+      max_tensor_size_per_row,
+      std::nullopt,
+      invalid_index_value,
+      divisor_for_int8,
+      std::nullopt,
+      per_embedding_scale);
+}
+
 TORCH_LIBRARY_FRAGMENT(st, m) {
   // fused_kmean_ann: Fused KMeans-based Approximate Nearest Neighbor search.
   //
@@ -327,12 +361,43 @@ TORCH_LIBRARY_FRAGMENT(st, m) {
       "Tensor? filtering_bit_index=None, "
       "Tensor? per_embedding_scale=None "
       ") -> (Tensor, Tensor)");
+
+  m.def(
+      "fused_kmean_ann_with_partial_masks("
+      "Tensor cluster_offsets, "
+      "Tensor cluster_ids, "
+      "Tensor cluster_length, "
+      "Tensor embeddings, "
+      "Tensor queries, "
+      "int max_tensor_size_per_row, "
+      "Tensor partial_mask_column_counts_cumsum, "
+      "Tensor partial_mask_first_item_offset_in_column, "
+      "Tensor partial_mask_column_results, "
+      "int invalid_index_value=-1,"
+      "int divisor_for_int8=-1,"
+      "Tensor? filtering_bit_index=None, "
+      "Tensor? per_embedding_scale=None, "
+      "Tensor? cluster_warp_size=None, "
+      "Tensor? cluster_warp_rounded_length_cumsum=None, "
+      "Tensor? cluster_remaining_length_cumsum=None, "
+      "Tensor? cluster_warp_size_cumsum=None, "
+      "int total_cluster_rounded_warps=0, "
+      "int total_cluster_remaining_warps=0 "
+      ") -> (Tensor, Tensor)");
 }
 
 TORCH_LIBRARY_IMPL(st, CPU, m) {
   m.impl(
       "fused_kmean_ann",
       torch::dispatch(c10::DispatchKey::CPU, TORCH_FN(fused_kmean_ann_cpu)));
+}
+
+TORCH_LIBRARY_IMPL(st, CPU, m) {
+  m.impl(
+      "fused_kmean_ann_with_partial_masks",
+      torch::dispatch(
+          c10::DispatchKey::CPU,
+          TORCH_FN(fused_kmean_ann_cpu_with_partial_masks)));
 }
 
 } // namespace st::ops::fused_kmean_ann
