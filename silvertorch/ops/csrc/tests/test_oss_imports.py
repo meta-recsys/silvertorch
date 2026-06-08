@@ -21,10 +21,10 @@ silvertorch.oss.* namespace (which ShipIt rewrites to silvertorch.*).
 Also verifies that ops are registered and callable after loading.
 """
 
+import importlib
 import os
 import unittest
 
-import silvertorch.ops._load_ops  # noqa: F401
 import torch
 
 
@@ -75,6 +75,11 @@ class TestOssModuleImports(unittest.TestCase):
 
 class TestOssOpsRegistered(unittest.TestCase):
     """Verify all torch.ops.st.* ops are registered after _load_ops."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        super().setUpClass()
+        importlib.import_module("silvertorch.oss.ops._load_ops")
 
     def test_bloom_index_build_registered(self) -> None:
         self.assertTrue(hasattr(torch.ops.st, "bloom_index_build"))
