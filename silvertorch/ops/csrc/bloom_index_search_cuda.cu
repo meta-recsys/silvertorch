@@ -688,6 +688,145 @@ __global__ void process_documents_on_assigned_cluster_columns_kernel(
   }
 }
 
+// Copies the device data pointers of a list of tensors into a single device
+// buffer with one HostToDevice copy, exposing them to kernels as a T**.
+template <typename T>
+class CudaTensorPointerListCooker {
+ public:
+  using pointer = const T*;
+  CudaTensorPointerListCooker(
+      const std::vector<Tensor>& tensor_list,
+      const at::Device& device) {
+    std::vector<pointer> pointerList;
+    pointerList.reserve(tensor_list.size());
+    for (const auto& tensor : tensor_list) {
+      pointerList.push_back(tensor.data_ptr<T>());
+    }
+    size_t size_to_copy = sizeof(pointer) * pointerList.size();
+    m_cudaVector = at::empty(
+        {static_cast<int64_t>(size_to_copy)},
+        c10::TensorOptions().dtype(at::kChar).device(device),
+        at::MemoryFormat::Contiguous);
+    m_pointerListPtr =
+        reinterpret_cast<pointer*>(m_cudaVector.data_ptr<int8_t>());
+    AT_CUDA_CHECK(cudaMemcpyAsync(
+        reinterpret_cast<void*>(m_pointerListPtr),
+        reinterpret_cast<void*>(pointerList.data()),
+        size_to_copy,
+        cudaMemcpyHostToDevice,
+        at::cuda::getCurrentCUDAStream()));
+  }
+  const pointer* get() {
+    return m_pointerListPtr;
+  }
+
+ private:
+  Tensor m_cudaVector;
+  pointer* m_pointerListPtr;
+};
+
+// Multi-chunk variant of the column-info kernel: computes per-cluster column
+// info for clusters spread across a list of chunks (indexed by chunk).
+__global__ void generate_column_info_for_cluster_list_kernel(
+    int64_t num_chunk,
+    int64_t num_clusters,
+    const int64_t* const* __restrict__ selected_cluster_offsets_list,
+    const int64_t* const* __restrict__ selected_cluster_lengths_list,
+    const int32_t* __restrict__ per_chunk_cluster_counts_cumsum,
+    const int32_t* __restrict__ cluster_assigned_chunk_indices,
+    PackedTensorAccessor64<int32_t, 1> column_counts,
+    PackedTensorAccessor64<int32_t, 1> start_column_ids,
+    PackedTensorAccessor64<int8_t, 1> first_item_offsets_in_column,
+    TORCH_DSA_KERNEL_ARGS) {
+  for (int64_t cluster_index =
+           static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+       cluster_index < num_clusters;
+       cluster_index += static_cast<int64_t>(blockDim.x) * gridDim.x) {
+    int32_t chunk_idx = cluster_assigned_chunk_indices[cluster_index];
+    int32_t local_cluster_idx = cluster_index -
+        (chunk_idx == 0
+             ? 0
+             : __ldg(per_chunk_cluster_counts_cumsum + chunk_idx - 1));
+    int64_t cluster_len =
+        __ldg((selected_cluster_lengths_list[chunk_idx]) + local_cluster_idx);
+    int64_t cluster_start =
+        __ldg((selected_cluster_offsets_list[chunk_idx]) + local_cluster_idx);
+    int8_t offset_in_col =
+        static_cast<int8_t>(cluster_start % C_BITS_IN_UINT64);
+    start_column_ids[cluster_index] =
+        static_cast<int32_t>(cluster_start / C_BITS_IN_UINT64);
+    first_item_offsets_in_column[cluster_index] = offset_in_col;
+    column_counts[cluster_index] = cluster_len > 0
+        ? static_cast<int32_t>(
+              (cluster_len + offset_in_col + C_BITS_IN_UINT64 - 1) /
+              C_BITS_IN_UINT64)
+        : 0;
+  }
+}
+
+// Multi-chunk variant of process_documents: one thread per output column across
+// all chunks; resolves the owning chunk/query and evaluates its query plan.
+template <int32_t STACK_SIZE, bool is_bloom_index_v2>
+__global__ void
+process_documents_on_assigned_cluster_columns_on_multiple_chunk_kernel(
+    int64_t num_queries,
+    const int64_t* const* __restrict__ bloom_index_list,
+    const int64_t* __restrict__ index_total_column_count_list,
+    const int64_t* const* __restrict__ bundle_b_offsets_list,
+    const int32_t* __restrict__ cluster_assigned_chunk_index,
+    const int32_t* __restrict__ per_chunk_cluster_counts_cumsum,
+    int64_t total_column_count,
+    const int32_t* __restrict__ column_assigned_cluster_index,
+    const int32_t* __restrict__ column_counts_cumsum,
+    const int32_t* __restrict__ start_column_ids,
+    PackedTensorAccessor64<int64_t, 1> column_mask_response,
+    const QueryPlanCuda<is_bloom_index_v2>* __restrict__ query_plan,
+    int64_t k,
+    int64_t p_k,
+    const uint64_t* __restrict__ query_plan_index_ptr,
+    TORCH_DSA_KERNEL_ARGS) {
+  for (int64_t column_index =
+           static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+       column_index < total_column_count;
+       column_index += static_cast<int64_t>(blockDim.x) * gridDim.x) {
+    int32_t assigned_cluster_index =
+        column_assigned_cluster_index[column_index];
+    int32_t assigned_chunk_index =
+        cluster_assigned_chunk_index[assigned_cluster_index];
+    int32_t chunk_start_cluster_idx =
+        (assigned_chunk_index == 0
+             ? 0
+             : per_chunk_cluster_counts_cumsum[assigned_chunk_index - 1]);
+    int32_t cluster_idx_in_chunk =
+        assigned_cluster_index - chunk_start_cluster_idx;
+    int32_t chunk_cluster_count =
+        per_chunk_cluster_counts_cumsum[assigned_chunk_index] -
+        chunk_start_cluster_idx;
+    int64_t probe = chunk_cluster_count / num_queries;
+    int64_t query_id = cluster_idx_in_chunk / probe;
+    query_id = query_plan_index_ptr == nullptr
+        ? query_id
+        : static_cast<int64_t>(query_plan_index_ptr[query_id]);
+    int64_t col_idx_in_local_cluster = column_index -
+        (assigned_cluster_index == 0
+             ? 0
+             : column_counts_cumsum[assigned_cluster_index - 1]);
+    int64_t column_id =
+        start_column_ids[assigned_cluster_index] + col_idx_in_local_cluster;
+    uint64_t result = run_query_plan<STACK_SIZE, is_bloom_index_v2>(
+        bloom_index_list[assigned_chunk_index],
+        index_total_column_count_list[assigned_chunk_index],
+        bundle_b_offsets_list == nullptr
+            ? nullptr
+            : bundle_b_offsets_list[assigned_chunk_index],
+        column_id,
+        k,
+        p_k,
+        query_plan[query_id]);
+    store<int64_t>(column_mask_response.data() + column_index, result, 0);
+  }
+}
+
 } // namespace
 
 template <bool is_bloom_index_v2>
@@ -969,29 +1108,17 @@ Tensor bloom_index_search_batch_cuda(
       return_bool_mask);
 }
 
-std::tuple<Tensor, Tensor, Tensor>
-bloom_index_search_batch_return_partial_response_cuda(
-    const Tensor& bloom_index,
-    const Tensor& bloom_bundle_b_offsets,
+// Prepare device-side query plans from encoded query-plan data. The returned
+// pointer is owned by `visitor`, which must outlive every kernel that uses it.
+static const QueryPlanCuda<true>* prepare_query_plan_cuda(
+    TensorCreationVisitor<true>& visitor,
     const Tensor& bloom_query_plans_data,
     const Tensor& bloom_query_plans_offsets,
-    const Tensor& selected_cluster_offsets,
-    const Tensor& selected_cluster_lengths,
-    int64_t k,
-    int64_t onebit_hash_k,
-    const std::optional<Tensor>& query_plan_index) {
-  TORCH_CHECK(bloom_index.is_cuda());
-  TORCH_CHECK(bloom_index.dim() == 1);
-  TORCH_CHECK(bloom_index.is_contiguous());
-  TORCH_CHECK(selected_cluster_offsets.is_cuda());
-  TORCH_CHECK(selected_cluster_lengths.is_cuda());
-
+    int32_t& query_plans_max_stack_size) {
   auto plans_data_cpu = bloom_query_plans_data.cpu();
   auto plans_offsets_cpu = bloom_query_plans_offsets.cpu();
 
   int64_t query_plans_size = plans_offsets_cpu.numel() / 8;
-  TensorCreationVisitor<true> tensor_creation_visitor(bloom_index.device());
-
   std::vector<QueryPlan<true>> query_plans;
   for (int64_t i = 0; i < query_plans_size; ++i) {
     Tensor operators_t, offsets_t, parameters_t, oneBitsPosition_t;
@@ -1026,33 +1153,32 @@ bloom_index_search_batch_return_partial_response_cuda(
     query_plans.push_back(std::move(plan));
   }
 
-  int32_t query_plans_max_stack_size = get_max_stack_size<true>(query_plans);
+  query_plans_max_stack_size = get_max_stack_size<true>(query_plans);
   for (int64_t i = 0; i < query_plans_size; ++i) {
-    tensor_creation_visitor.add_size_and_data(query_plans[i]);
+    visitor.add_size_and_data(query_plans[i]);
   }
-  tensor_creation_visitor.add_size_without_data(
-      query_plans_size * sizeof(QueryPlanCuda<true>));
+  visitor.add_size_without_data(query_plans_size * sizeof(QueryPlanCuda<true>));
 
   std::vector<QueryPlanCuda<true>> query_plan_cudas_host;
   for (int64_t i = 0; i < query_plans_size; ++i) {
-    query_plan_cudas_host.push_back(
-        tensor_creation_visitor.visit(query_plans[i]));
+    query_plan_cudas_host.push_back(visitor.visit(query_plans[i]));
   }
-  const QueryPlanCuda<true>* query_plan_cuda =
-      tensor_creation_visitor.visit_with_data(query_plan_cudas_host);
+  return visitor.visit_with_data(query_plan_cudas_host);
+}
 
-  const uint64_t* query_plan_index_ptr = nullptr;
-  if (query_plan_index) {
-    TORCH_CHECK(query_plan_index->size(0) == selected_cluster_lengths.size(0));
-    TORCH_CHECK(query_plan_index->is_cuda());
-    TORCH_CHECK(query_plan_index->dim() == 1);
-    query_plan_index_ptr = reinterpret_cast<const uint64_t*>(
-        query_plan_index->data_ptr<int64_t>());
-  }
-
-  at::cuda::OptionalCUDAGuard device_guard;
-  device_guard.set_index(bloom_index.get_device());
-
+// Run the partial-response search for one chunk given already-prepared device
+// query plans. Shared by the single- and multiple-index CUDA ops.
+static std::tuple<Tensor, Tensor, Tensor>
+bloom_index_search_return_partial_response_one_chunk_cuda(
+    const Tensor& bloom_index,
+    const Tensor& bloom_bundle_b_offsets,
+    const QueryPlanCuda<true>* query_plan_cuda,
+    int32_t query_plans_max_stack_size,
+    const Tensor& selected_cluster_offsets,
+    const Tensor& selected_cluster_lengths,
+    int64_t k,
+    int64_t onebit_hash_k,
+    const uint64_t* query_plan_index_ptr) {
   auto [column_counts, start_column_ids, first_item_offsets_in_column] =
       generate_column_info_for_clusters(
           selected_cluster_offsets, selected_cluster_lengths);
@@ -1082,6 +1208,430 @@ bloom_index_search_batch_return_partial_response_cuda(
       std::move(column_counts_cumsum_tensor),
       std::move(first_item_offsets_in_column),
       std::move(column_mask_response));
+}
+
+std::tuple<Tensor, Tensor, Tensor>
+bloom_index_search_batch_return_partial_response_cuda(
+    const Tensor& bloom_index,
+    const Tensor& bloom_bundle_b_offsets,
+    const Tensor& bloom_query_plans_data,
+    const Tensor& bloom_query_plans_offsets,
+    const Tensor& selected_cluster_offsets,
+    const Tensor& selected_cluster_lengths,
+    int64_t k,
+    int64_t onebit_hash_k,
+    const std::optional<Tensor>& query_plan_index) {
+  TORCH_CHECK(bloom_index.is_cuda());
+  TORCH_CHECK(bloom_index.dim() == 1);
+  TORCH_CHECK(bloom_index.is_contiguous());
+  TORCH_CHECK(selected_cluster_offsets.is_cuda());
+  TORCH_CHECK(selected_cluster_lengths.is_cuda());
+
+  TensorCreationVisitor<true> tensor_creation_visitor(bloom_index.device());
+  int32_t query_plans_max_stack_size = 0;
+  const QueryPlanCuda<true>* query_plan_cuda = prepare_query_plan_cuda(
+      tensor_creation_visitor,
+      bloom_query_plans_data,
+      bloom_query_plans_offsets,
+      query_plans_max_stack_size);
+
+  const uint64_t* query_plan_index_ptr = nullptr;
+  if (query_plan_index) {
+    TORCH_CHECK(query_plan_index->size(0) == selected_cluster_lengths.size(0));
+    TORCH_CHECK(query_plan_index->is_cuda());
+    TORCH_CHECK(query_plan_index->dim() == 1);
+    query_plan_index_ptr = reinterpret_cast<const uint64_t*>(
+        query_plan_index->data_ptr<int64_t>());
+  }
+
+  at::cuda::OptionalCUDAGuard device_guard;
+  device_guard.set_index(bloom_index.get_device());
+
+  return bloom_index_search_return_partial_response_one_chunk_cuda(
+      bloom_index,
+      bloom_bundle_b_offsets,
+      query_plan_cuda,
+      query_plans_max_stack_size,
+      selected_cluster_offsets,
+      selected_cluster_lengths,
+      k,
+      onebit_hash_k,
+      query_plan_index_ptr);
+}
+
+std::tuple<Tensor, Tensor, Tensor, Tensor, Tensor, std::vector<int64_t>>
+generate_column_info_for_cluster_list(
+    const std::vector<Tensor>& selected_cluster_offsets_list,
+    const std::vector<Tensor>& selected_cluster_lengths_list,
+    const at::Device& device) {
+  // this function will be just one step of a kernel, so I didn't add
+  // device guard in this function, the guard will be the caller
+  // function's responsibility.
+  CudaTensorPointerListCooker<int64_t> selected_cluster_offsets_list_cooker(
+      selected_cluster_offsets_list, device);
+  CudaTensorPointerListCooker<int64_t> selected_cluster_lengths_list_cooker(
+      selected_cluster_lengths_list, device);
+  std::vector<int64_t> per_chunk_cluster_count_list;
+  per_chunk_cluster_count_list.reserve(selected_cluster_lengths_list.size());
+  for (auto selected_cluster_offsets : selected_cluster_lengths_list) {
+    per_chunk_cluster_count_list.push_back(
+        static_cast<int64_t>(selected_cluster_offsets.numel()));
+  }
+  Tensor per_chunk_cluster_counts = at::tensor(
+      per_chunk_cluster_count_list,
+      c10::TensorOptions().dtype(at::kInt).device(device));
+  Tensor per_chunk_cluster_counts_cumsum =
+      per_chunk_cluster_counts.cumsum(/*dim=*/0, /*dtype=*/at::kInt);
+  Tensor cluster_assigned_chunk_indices =
+      torch::arange(
+          static_cast<int64_t>(selected_cluster_lengths_list.size()),
+          c10::TensorOptions().dtype(at::kInt).device(device))
+          .repeat_interleave(per_chunk_cluster_counts);
+  int64_t total_cluster_count = cluster_assigned_chunk_indices.numel();
+  constexpr int64_t kThreads = 256L;
+  int64_t kBlocks = 128L *
+      CHECK_NOTNULL(at::cuda::getCurrentDeviceProperties())
+          ->multiProcessorCount;
+  int64_t block_size = total_cluster_count <= 128 ? 128L : kThreads;
+  int64_t grid_size =
+      std::min(kBlocks, (total_cluster_count + block_size - 1) / block_size);
+  Tensor column_counts = at::empty(
+      {total_cluster_count},
+      c10::TensorOptions().dtype(at::kInt).device(device));
+  Tensor start_column_ids = at::empty(
+      {total_cluster_count},
+      c10::TensorOptions().dtype(at::kInt).device(device));
+  Tensor first_item_offsets_in_column = at::empty(
+      {total_cluster_count},
+      c10::TensorOptions().dtype(at::kChar).device(device));
+  TORCH_DSA_KERNEL_LAUNCH(
+      generate_column_info_for_cluster_list_kernel,
+      grid_size,
+      block_size,
+      0,
+      at::cuda::getCurrentCUDAStream(),
+      static_cast<int64_t>(selected_cluster_offsets_list.size()),
+      total_cluster_count,
+      selected_cluster_offsets_list_cooker.get(),
+      selected_cluster_lengths_list_cooker.get(),
+      per_chunk_cluster_counts_cumsum.data_ptr<int32_t>(),
+      cluster_assigned_chunk_indices.data_ptr<int32_t>(),
+      column_counts.packed_accessor64<int32_t, 1>(),
+      start_column_ids.packed_accessor64<int32_t, 1>(),
+      first_item_offsets_in_column.packed_accessor64<int8_t, 1>());
+  return std::make_tuple(
+      std::move(column_counts),
+      std::move(start_column_ids),
+      std::move(first_item_offsets_in_column),
+      std::move(per_chunk_cluster_counts_cumsum),
+      std::move(cluster_assigned_chunk_indices),
+      std::move(per_chunk_cluster_count_list));
+}
+
+template <bool is_bloom_index_v2>
+Tensor process_documents_on_assigned_cluster_columns_multiple_chunks(
+    int64_t num_queries,
+    const std::vector<Tensor>& bloom_index_list,
+    const int64_t* const*
+        bloom_bundle_b_offsets_list, // only used when is_bloom_index_v2 is true
+    const Tensor& index_total_column_counts, // how many columns in each index.
+    const Tensor& cluster_assigned_chunk_index,
+    const Tensor& chunk_cluster_counts_cumsum,
+    const Tensor& column_assigned_cluster_index,
+    const Tensor& column_counts_cumsum,
+    const Tensor& start_column_ids,
+    const QueryPlanCuda<is_bloom_index_v2>* query_plan,
+    int64_t k,
+    int64_t onebit_position_k, // only used when is_bloom_index_v2 is true
+    int32_t query_plans_max_stack_size,
+    const uint64_t* query_plan_index_ptr,
+    const at::Device& device) {
+  constexpr int64_t kThreads = 256L;
+  int64_t kBlocks = 128L *
+      CHECK_NOTNULL(at::cuda::getCurrentDeviceProperties())
+          ->multiProcessorCount;
+  int64_t total_column_count = column_assigned_cluster_index.numel();
+  int64_t block_size = kThreads;
+  int64_t grid_size =
+      std::min(kBlocks, (total_column_count + block_size - 1) / block_size);
+  Tensor column_mask_response = at::zeros(
+      {total_column_count},
+      c10::TensorOptions().dtype(at::kLong).device(device));
+  CudaTensorPointerListCooker<int64_t> bloom_index_list_cooker(
+      bloom_index_list, device);
+#define LAUNCH_KERNEL_WITH_STACK_SIZE(STACK_SIZE)                              \
+  TORCH_DSA_KERNEL_LAUNCH(                                                     \
+      (process_documents_on_assigned_cluster_columns_on_multiple_chunk_kernel< \
+          STACK_SIZE,                                                          \
+          is_bloom_index_v2>),                                                 \
+      grid_size,                                                               \
+      block_size,                                                              \
+      0,                                                                       \
+      at::cuda::getCurrentCUDAStream(),                                        \
+      num_queries,                                                             \
+      bloom_index_list_cooker.get(),                                           \
+      index_total_column_counts.data_ptr<int64_t>(),                           \
+      bloom_bundle_b_offsets_list,                                             \
+      cluster_assigned_chunk_index.data_ptr<int32_t>(),                        \
+      chunk_cluster_counts_cumsum.data_ptr<int32_t>(),                         \
+      total_column_count,                                                      \
+      column_assigned_cluster_index.data_ptr<int32_t>(),                       \
+      column_counts_cumsum.data_ptr<int32_t>(),                                \
+      start_column_ids.data_ptr<int32_t>(),                                    \
+      column_mask_response.packed_accessor64<int64_t, 1>(),                    \
+      query_plan,                                                              \
+      k,                                                                       \
+      onebit_position_k,                                                       \
+      query_plan_index_ptr);
+  if (query_plans_max_stack_size <= C_FAST_ROUTE_STACK_SIZE_FIRST_LEVEL) {
+    LAUNCH_KERNEL_WITH_STACK_SIZE(C_FAST_ROUTE_STACK_SIZE_FIRST_LEVEL);
+  } else {
+    LAUNCH_KERNEL_WITH_STACK_SIZE(0);
+  }
+#undef LAUNCH_KERNEL_WITH_STACK_SIZE
+  return column_mask_response;
+}
+
+template <bool is_bloom_index_v2>
+std::tuple<std::vector<Tensor>, std::vector<Tensor>, std::vector<Tensor>>
+bloom_index_search_common_return_partial_response_multiple_chunks(
+    int64_t num_queries,
+    const std::vector<Tensor>& bloom_index_list,
+    const int64_t* const*
+        bloom_bundle_b_offsets_list, // only used when is_bloom_index_v2 is true
+    const Tensor& index_total_column_counts, // how many columns in each index.
+    const QueryPlanCuda<is_bloom_index_v2>* query_plan_cuda,
+    int32_t query_plans_max_stack_size,
+    const std::vector<Tensor>& selected_cluster_offsets_list,
+    const std::vector<Tensor>& selected_cluster_lengths_list,
+    int64_t k,
+    int64_t onebit_position_k, // only used when is_bloom_index_v2 is true)
+    const std::optional<Tensor>& query_plan_index,
+    const at::Device& device) {
+  size_t num_chunk = bloom_index_list.size();
+  TORCH_CHECK(selected_cluster_offsets_list.size() == num_chunk);
+  TORCH_CHECK(selected_cluster_lengths_list.size() == num_chunk);
+  for (size_t i = 0; i < num_chunk; ++i) {
+    TORCH_CHECK(bloom_index_list[i].device() == device);
+    TORCH_CHECK(bloom_index_list[i].is_contiguous())
+    TORCH_CHECK(selected_cluster_offsets_list[i].is_contiguous());
+    TORCH_CHECK(selected_cluster_lengths_list[i].is_contiguous());
+    TORCH_CHECK(selected_cluster_offsets_list[i].device() == device);
+    TORCH_CHECK(selected_cluster_lengths_list[i].device() == device);
+    TORCH_CHECK(selected_cluster_offsets_list[i].dim() == 2);
+    TORCH_CHECK(selected_cluster_lengths_list[i].dim() == 2);
+    TORCH_CHECK(selected_cluster_offsets_list[i].size(0) == num_queries);
+    TORCH_CHECK(selected_cluster_lengths_list[i].size(0) == num_queries);
+    TORCH_CHECK(
+        selected_cluster_offsets_list[i].size(1) ==
+        selected_cluster_lengths_list[i].size(1));
+  }
+  const uint64_t* query_plan_index_ptr = nullptr;
+  if (query_plan_index) {
+    TORCH_CHECK(query_plan_index->size(0) == num_queries);
+    TORCH_CHECK(query_plan_index->device() == device);
+    TORCH_CHECK(query_plan_index->dim() == 1);
+    TORCH_CHECK(query_plan_index->is_contiguous());
+    query_plan_index_ptr = reinterpret_cast<const uint64_t*>(
+        query_plan_index->data_ptr<int64_t>());
+  }
+  at::cuda::OptionalCUDAGuard device_guard;
+  device_guard.set_index(device.index());
+
+  auto
+      [column_counts_cumsum,
+       start_column_indices,
+       first_item_offsets_in_column,
+       chunk_cluster_counts_cumsum,
+       cluster_assigned_chunk_index,
+       cluster_counts_per_chunk_vec] =
+          generate_column_info_for_cluster_list(
+              selected_cluster_offsets_list,
+              selected_cluster_lengths_list,
+              device);
+  // column_counts_cumsum currently holds the raw per-cluster column counts.
+  // Split them per chunk (clusters are grouped by chunk) so we can build each
+  // chunk's own column_counts_cumsum and total column count.
+  std::vector<Tensor> column_counts_pieces = at::split_with_sizes(
+      column_counts_cumsum, cluster_counts_per_chunk_vec, 0);
+
+  // Global column->cluster assignment for the single fused process kernel.
+  Tensor column_counts_cumsum_global =
+      column_counts_cumsum.cumsum(/*dim=*/0, /*dtype=*/at::kInt);
+  Tensor column_assigned_cluster_index =
+      torch::arange(
+          column_counts_cumsum.numel(),
+          c10::TensorOptions().dtype(at::kInt).device(device))
+          .repeat_interleave(column_counts_cumsum);
+
+  Tensor column_mask_response =
+      process_documents_on_assigned_cluster_columns_multiple_chunks<
+          is_bloom_index_v2>(
+          num_queries,
+          bloom_index_list,
+          bloom_bundle_b_offsets_list,
+          index_total_column_counts,
+          cluster_assigned_chunk_index,
+          chunk_cluster_counts_cumsum,
+          column_assigned_cluster_index,
+          column_counts_cumsum_global,
+          start_column_indices,
+          query_plan_cuda,
+          k,
+          onebit_position_k,
+          query_plans_max_stack_size,
+          query_plan_index_ptr,
+          device);
+
+  std::vector<Tensor> column_counts_cumsum_tensor_list;
+  column_counts_cumsum_tensor_list.reserve(num_chunk);
+  std::vector<int64_t> column_counts_per_chunk_vec;
+  column_counts_per_chunk_vec.reserve(num_chunk);
+  for (size_t i = 0; i < num_chunk; ++i) {
+    Tensor per_chunk_cumsum =
+        column_counts_pieces[i].cumsum(/*dim=*/0, /*dtype=*/at::kInt);
+    column_counts_per_chunk_vec.push_back(
+        per_chunk_cumsum.numel() == 0 ? 0
+                                      : per_chunk_cumsum[-1].item<int64_t>());
+    column_counts_cumsum_tensor_list.push_back(std::move(per_chunk_cumsum));
+  }
+  std::vector<Tensor> first_item_offsets_in_column_tensor_list =
+      at::split_with_sizes(
+          first_item_offsets_in_column, cluster_counts_per_chunk_vec, 0);
+  std::vector<Tensor> column_mask_response_tensor_list = at::split_with_sizes(
+      column_mask_response, column_counts_per_chunk_vec, 0);
+  return std::make_tuple(
+      std::move(column_counts_cumsum_tensor_list),
+      std::move(first_item_offsets_in_column_tensor_list),
+      std::move(column_mask_response_tensor_list));
+}
+
+std::tuple<std::vector<Tensor>, std::vector<Tensor>, std::vector<Tensor>>
+bloom_index_search_batch_return_partial_response_multiple_cuda(
+    const std::vector<Tensor>& list_bloom_index,
+    const std::vector<Tensor>& list_bloom_bundle_b_offsets,
+    const Tensor& bloom_query_plans_data,
+    const Tensor& bloom_query_plans_offsets,
+    const std::vector<Tensor>& list_selected_cluster_offsets,
+    const std::vector<Tensor>& list_selected_cluster_lengths,
+    int64_t k,
+    int64_t onebit_hash_k,
+    const std::optional<Tensor>& query_plan_index,
+    bool fuse) {
+  const auto n = list_bloom_index.size();
+  TORCH_CHECK(
+      n > 0,
+      "bloom_index_search_batch_return_partial_response_multiple: "
+      "list_bloom_index should not be empty.");
+  TORCH_CHECK(
+      list_bloom_bundle_b_offsets.size() == n,
+      "list_bloom_index and list_bloom_bundle_b_offsets should have the same size, got ",
+      n,
+      " vs ",
+      list_bloom_bundle_b_offsets.size());
+  TORCH_CHECK(
+      list_selected_cluster_offsets.size() == n,
+      "list_bloom_index and list_selected_cluster_offsets should have the same size, got ",
+      n,
+      " vs ",
+      list_selected_cluster_offsets.size());
+  TORCH_CHECK(
+      list_selected_cluster_lengths.size() == n,
+      "list_bloom_index and list_selected_cluster_lengths should have the same size, got ",
+      n,
+      " vs ",
+      list_selected_cluster_lengths.size());
+  for (size_t i = 0; i < n; ++i) {
+    TORCH_CHECK(list_bloom_index[i].is_cuda());
+    TORCH_CHECK(list_bloom_index[i].dim() == 1);
+    TORCH_CHECK(list_bloom_index[i].is_contiguous());
+  }
+
+  const auto& first_bloom_index = list_bloom_index.front();
+  TensorCreationVisitor<true> tensor_creation_visitor(
+      first_bloom_index.device());
+  int32_t query_plans_max_stack_size = 0;
+  const QueryPlanCuda<true>* query_plan_cuda = prepare_query_plan_cuda(
+      tensor_creation_visitor,
+      bloom_query_plans_data,
+      bloom_query_plans_offsets,
+      query_plans_max_stack_size);
+
+  const uint64_t* query_plan_index_ptr = nullptr;
+  if (query_plan_index) {
+    TORCH_CHECK(
+        query_plan_index->size(0) == list_selected_cluster_lengths[0].size(0));
+    TORCH_CHECK(query_plan_index->is_cuda());
+    TORCH_CHECK(query_plan_index->dim() == 1);
+    query_plan_index_ptr = reinterpret_cast<const uint64_t*>(
+        query_plan_index->data_ptr<int64_t>());
+  }
+
+  at::cuda::OptionalCUDAGuard device_guard;
+  device_guard.set_index(first_bloom_index.get_device());
+
+  if (fuse) {
+    int64_t num_queries = query_plan_index
+        ? query_plan_index->size(0)
+        : list_selected_cluster_lengths[0].size(0);
+    std::vector<int64_t> index_total_column_counts_vec;
+    index_total_column_counts_vec.reserve(n);
+    for (const auto& bundle_b_offsets : list_bloom_bundle_b_offsets) {
+      index_total_column_counts_vec.push_back(
+          (bundle_b_offsets.numel() - 1) * C_BLOOM_V2_COL_BUNDLE_SIZE);
+    }
+    Tensor index_total_column_counts = at::tensor(
+        index_total_column_counts_vec,
+        c10::TensorOptions().dtype(at::kLong).device(
+            first_bloom_index.device()));
+    CudaTensorPointerListCooker<int64_t> bloom_bundle_b_offsets_list_cooker(
+        list_bloom_bundle_b_offsets, first_bloom_index.device());
+    return bloom_index_search_common_return_partial_response_multiple_chunks<
+        true>(
+        num_queries,
+        list_bloom_index,
+        bloom_bundle_b_offsets_list_cooker.get(),
+        index_total_column_counts,
+        query_plan_cuda,
+        query_plans_max_stack_size,
+        list_selected_cluster_offsets,
+        list_selected_cluster_lengths,
+        k,
+        onebit_hash_k,
+        query_plan_index,
+        first_bloom_index.device());
+  }
+
+  std::vector<Tensor> list_column_counts_cumsum;
+  list_column_counts_cumsum.reserve(n);
+  std::vector<Tensor> list_first_item_offsets_in_column;
+  list_first_item_offsets_in_column.reserve(n);
+  std::vector<Tensor> list_column_mask_response;
+  list_column_mask_response.reserve(n);
+  for (size_t i = 0; i < n; ++i) {
+    auto
+        [column_counts_cumsum,
+         first_item_offsets_in_column,
+         column_mask_response] =
+            bloom_index_search_return_partial_response_one_chunk_cuda(
+                list_bloom_index[i],
+                list_bloom_bundle_b_offsets[i],
+                query_plan_cuda,
+                query_plans_max_stack_size,
+                list_selected_cluster_offsets[i],
+                list_selected_cluster_lengths[i],
+                k,
+                onebit_hash_k,
+                query_plan_index_ptr);
+    list_column_counts_cumsum.push_back(std::move(column_counts_cumsum));
+    list_first_item_offsets_in_column.push_back(
+        std::move(first_item_offsets_in_column));
+    list_column_mask_response.push_back(std::move(column_mask_response));
+  }
+  return std::make_tuple(
+      std::move(list_column_counts_cumsum),
+      std::move(list_first_item_offsets_in_column),
+      std::move(list_column_mask_response));
 }
 
 static std::tuple<Tensor, Tensor, Tensor>
@@ -1119,6 +1669,15 @@ TORCH_LIBRARY_IMPL(st, CUDA, m) {
       torch::dispatch(
           c10::DispatchKey::CUDA,
           TORCH_FN(bloom_index_search_batch_return_partial_response_cuda)));
+}
+
+TORCH_LIBRARY_IMPL(st, CUDA, m) {
+  m.impl(
+      "bloom_index_search_batch_return_partial_response_multiple",
+      torch::dispatch(
+          c10::DispatchKey::CUDA,
+          TORCH_FN(
+              bloom_index_search_batch_return_partial_response_multiple_cuda)));
 }
 } // namespace bloom_search
 } // namespace ops
