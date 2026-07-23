@@ -614,6 +614,9 @@ class TestFusedKmeanAnnWithPartialMasks(unittest.TestCase):
 
     def test_registered(self) -> None:
         self.assertTrue(hasattr(torch.ops.st, "fused_kmean_ann_with_partial_masks"))
+        self.assertTrue(
+            hasattr(torch.ops.st, "fused_kmean_ann_with_partial_masks_multiple")
+        )
 
     def _make_partial_masks(
         self,
@@ -625,7 +628,6 @@ class TestFusedKmeanAnnWithPartialMasks(unittest.TestCase):
         """Generate all-pass partial masks (all bits set) for testing."""
         batch_size = cluster_ids.size(0)
         num_probes = cluster_ids.size(1)
-        total_clusters = batch_size * num_probes
 
         cumsum_list = []
         offset_list = []
@@ -648,6 +650,141 @@ class TestFusedKmeanAnnWithPartialMasks(unittest.TestCase):
         first_offsets = torch.tensor(offset_list, dtype=torch.int8, device=device)
         col_masks = torch.tensor(mask_list, dtype=torch.long, device=device)
         return col_cumsum, first_offsets, col_masks
+
+    def _run_multiple(
+        self,
+        device: str,
+        queries: torch.Tensor,
+        list_cluster_offsets: list[torch.Tensor],
+        list_cluster_ids: list[torch.Tensor],
+        list_cluster_lengths: list[torch.Tensor],
+        list_embeddings: list[torch.Tensor],
+        list_max_sizes: list[int],
+        list_col_cumsum: list[torch.Tensor],
+        list_first_offsets: list[torch.Tensor],
+        list_col_masks: list[torch.Tensor],
+        fuse: bool = False,
+    ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+        return torch.ops.st.fused_kmean_ann_with_partial_masks_multiple(
+            queries.to(device),
+            [t.to(device) for t in list_cluster_offsets],
+            [t.to(device) for t in list_cluster_ids],
+            [t.to(device) for t in list_cluster_lengths],
+            [t.to(device) for t in list_embeddings],
+            list_max_sizes,
+            [t.to(device) for t in list_col_cumsum],
+            [t.to(device) for t in list_first_offsets],
+            [t.to(device) for t in list_col_masks],
+            -1,
+            -1,
+            None,
+            None,
+            fuse,
+        )
+
+    def _verify_results(
+        self,
+        indices: torch.Tensor,
+        scores: torch.Tensor,
+        expected_indices: torch.Tensor,
+        expected_scores: torch.Tensor,
+    ) -> None:
+        sorted_indices, sort_order = indices.sort(dim=1, descending=True)
+        sorted_scores = torch.gather(scores, 1, sort_order)
+        sorted_expected_indices, expected_sort_order = expected_indices.sort(
+            dim=1, descending=True
+        )
+        sorted_expected_scores = torch.gather(expected_scores, 1, expected_sort_order)
+        torch.testing.assert_close(
+            sorted_indices, sorted_expected_indices.to(torch.int32)
+        )
+        torch.testing.assert_close(
+            sorted_scores,
+            sorted_expected_scores,
+            atol=0.005,
+            rtol=0.01,
+        )
+
+    def _build_multiple_case(
+        self,
+        dim: int,
+        batch_size: int,
+        cluster_lengths_per_index: list[list[int]],
+        dtype: torch.dtype = torch.float32,
+    ) -> tuple[
+        torch.Tensor,
+        list[torch.Tensor],
+        list[torch.Tensor],
+        list[torch.Tensor],
+        list[torch.Tensor],
+        list[int],
+        list[torch.Tensor],
+        list[torch.Tensor],
+        list[torch.Tensor],
+    ]:
+        if dtype == torch.int8:
+            queries = torch.randint(-16, 16, (batch_size, dim), dtype=dtype)
+        else:
+            queries = torch.randn(batch_size, dim, dtype=dtype)
+
+        list_cluster_offsets = []
+        list_cluster_ids = []
+        list_cluster_lengths = []
+        list_embeddings = []
+        list_max_sizes = []
+        list_col_cumsum = []
+        list_first_offsets = []
+        list_col_masks = []
+
+        for index_id, cluster_lengths in enumerate(cluster_lengths_per_index):
+            cluster_lengths_t = torch.tensor(cluster_lengths, dtype=torch.long)
+            cluster_offsets = torch.cat(
+                [
+                    torch.zeros(1, dtype=torch.long),
+                    cluster_lengths_t.cumsum(0)[:-1],
+                ]
+            )
+            total_docs = int(cluster_lengths_t.sum().item())
+            if dtype == torch.int8:
+                embeddings = torch.randint(-16, 16, (total_docs, dim), dtype=dtype)
+            else:
+                embeddings = torch.randn(total_docs, dim, dtype=dtype)
+            n_clusters = len(cluster_lengths)
+            n_probes = min(3, n_clusters)
+            cluster_ids = (
+                torch.arange(batch_size * n_probes, dtype=torch.long)
+                .view(batch_size, n_probes)
+                .add(index_id)
+                .remainder(n_clusters)
+            )
+            selected_cluster_lengths = cluster_lengths_t[cluster_ids]
+            max_size = int(selected_cluster_lengths.sum(-1).max().item())
+            col_cumsum, first_offsets, col_masks = self._make_partial_masks(
+                cluster_offsets,
+                cluster_ids,
+                selected_cluster_lengths,
+            )
+
+            list_cluster_offsets.append(cluster_offsets)
+            list_cluster_ids.append(cluster_ids)
+            list_cluster_lengths.append(selected_cluster_lengths)
+            list_embeddings.append(embeddings)
+            list_max_sizes.append(max_size)
+            list_col_cumsum.append(col_cumsum)
+            list_first_offsets.append(first_offsets)
+            list_col_masks.append(col_masks)
+
+        return (
+            queries,
+            list_cluster_offsets,
+            list_cluster_ids,
+            list_cluster_lengths,
+            list_embeddings,
+            list_max_sizes,
+            list_col_cumsum,
+            list_first_offsets,
+            list_col_masks,
+        )
 
     def test_cpu_basic(self) -> None:
         n_clusters = 3
@@ -752,3 +889,146 @@ class TestFusedKmeanAnnWithPartialMasks(unittest.TestCase):
             divisor_for_int8=127,
         )
         self.assertEqual(scores.dtype, torch.float16)
+
+    def test_fused_kmean_ann_with_partial_masks_multiple_matches_individual_cpu(
+        self,
+    ) -> None:
+        (
+            queries,
+            list_cluster_offsets,
+            list_cluster_ids,
+            list_cluster_lengths,
+            list_embeddings,
+            list_max_sizes,
+            list_col_cumsum,
+            list_first_offsets,
+            list_col_masks,
+        ) = self._build_multiple_case(
+            dim=64,
+            batch_size=2,
+            cluster_lengths_per_index=[[31, 33, 8], [16, 32, 24], [20, 40, 12]],
+        )
+
+        multi_scores, multi_indices = self._run_multiple(
+            "cpu",
+            queries,
+            list_cluster_offsets,
+            list_cluster_ids,
+            list_cluster_lengths,
+            list_embeddings,
+            list_max_sizes,
+            list_col_cumsum,
+            list_first_offsets,
+            list_col_masks,
+        )
+
+        self.assertEqual(len(multi_scores), len(list_cluster_offsets))
+        self.assertEqual(len(multi_indices), len(list_cluster_offsets))
+        for i in range(len(list_cluster_offsets)):
+            individual_scores, individual_indices = (
+                torch.ops.st.fused_kmean_ann_with_partial_masks(
+                    list_cluster_offsets[i],
+                    list_cluster_ids[i],
+                    list_cluster_lengths[i],
+                    list_embeddings[i],
+                    queries,
+                    list_max_sizes[i],
+                    list_col_cumsum[i],
+                    list_first_offsets[i],
+                    list_col_masks[i],
+                )
+            )
+            self._verify_results(
+                multi_indices[i],
+                multi_scores[i],
+                individual_indices,
+                individual_scores,
+            )
+
+    def test_fused_kmean_ann_with_partial_masks_multiple_fuse_parity_gpu(
+        self,
+    ) -> None:
+        if not HAS_CUDA:
+            self.skipTest("CUDA not available")
+
+        for dim, num_indices, batch_size in (
+            (64, 1, 4),
+            (96, 2, 4),
+            (128, 4, 8),
+        ):
+            with self.subTest(dim=dim, num_indices=num_indices, batch_size=batch_size):
+                cluster_lengths_per_index = [
+                    [31 + i, 32, 33, 17 + i] for i in range(num_indices)
+                ]
+                (
+                    queries,
+                    list_cluster_offsets,
+                    list_cluster_ids,
+                    list_cluster_lengths,
+                    list_embeddings,
+                    list_max_sizes,
+                    list_col_cumsum,
+                    list_first_offsets,
+                    list_col_masks,
+                ) = self._build_multiple_case(
+                    dim=dim,
+                    batch_size=batch_size,
+                    cluster_lengths_per_index=cluster_lengths_per_index,
+                    dtype=torch.float16,
+                )
+
+                nonfused_scores, nonfused_indices = self._run_multiple(
+                    "cuda",
+                    queries,
+                    list_cluster_offsets,
+                    list_cluster_ids,
+                    list_cluster_lengths,
+                    list_embeddings,
+                    list_max_sizes,
+                    list_col_cumsum,
+                    list_first_offsets,
+                    list_col_masks,
+                    fuse=False,
+                )
+                fused_scores, fused_indices = self._run_multiple(
+                    "cuda",
+                    queries,
+                    list_cluster_offsets,
+                    list_cluster_ids,
+                    list_cluster_lengths,
+                    list_embeddings,
+                    list_max_sizes,
+                    list_col_cumsum,
+                    list_first_offsets,
+                    list_col_masks,
+                    fuse=True,
+                )
+
+                self.assertEqual(len(nonfused_scores), num_indices)
+                self.assertEqual(len(fused_scores), num_indices)
+                for i in range(num_indices):
+                    self._verify_results(
+                        fused_indices[i],
+                        fused_scores[i],
+                        nonfused_indices[i],
+                        nonfused_scores[i],
+                    )
+                    individual_scores, individual_indices = (
+                        torch.ops.st.fused_kmean_ann_with_partial_masks(
+                            list_cluster_offsets[i].cuda(),
+                            list_cluster_ids[i].cuda(),
+                            list_cluster_lengths[i].cuda(),
+                            list_embeddings[i].cuda(),
+                            queries.cuda(),
+                            list_max_sizes[i],
+                            list_col_cumsum[i].cuda(),
+                            list_first_offsets[i].cuda(),
+                            list_col_masks[i].cuda(),
+                        )
+                    )
+                    self._verify_results(
+                        fused_indices[i],
+                        fused_scores[i],
+                        individual_indices,
+                        individual_scores,
+                    )
