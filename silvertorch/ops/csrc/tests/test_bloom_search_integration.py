@@ -19,6 +19,17 @@ import unittest
 import silvertorch.ops._load_ops  # noqa: F401
 import torch
 
+# Keep integration test library loading aligned with the dedicated bloom tests.
+# @oss-disable[end= ]: torch.ops.load_library("//silvertorch/oss/ops/csrc:bloom_indexer")
+# @oss-disable[end= ]: torch.ops.load_library("//silvertorch/oss/ops/csrc:bloom_indexer_gpu")
+# @oss-disable[end= ]: torch.ops.load_library("//silvertorch/oss/ops/csrc:bloom_index_search")
+torch.ops.load_library(
+    "//silvertorch/oss/ops/csrc:bloom_index_search_gpu"
+# @oss-disable[end= ]: )
+torch.ops.load_library(
+    "//silvertorch/oss/ops/csrc:expression_query_parser"
+# @oss-disable[end= ]: )
+
 
 def _make_features(
     num_docs: int,

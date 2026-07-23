@@ -260,6 +260,56 @@ static std::tuple<Tensor, Tensor> fused_kmean_ann_cpu_with_partial_masks(
       per_embedding_scale);
 }
 
+static std::tuple<std::vector<Tensor>, std::vector<Tensor>>
+fused_kmean_ann_with_partial_masks_multiple_cpu(
+    const Tensor& queries,
+    const std::vector<Tensor>& list_cluster_offsets,
+    const std::vector<Tensor>& list_selected_cluster_ids,
+    const std::vector<Tensor>& list_selected_cluster_lengths,
+    const std::vector<Tensor>& list_embeddings,
+    const std::vector<int64_t>& list_max_tensor_size_per_row,
+    const std::vector<Tensor>& list_partial_mask_column_counts_cumsum,
+    const std::vector<Tensor>& list_partial_mask_first_item_offset_in_column,
+    const std::vector<Tensor>& list_partial_mask_column_results,
+    int64_t invalid_index_value,
+    int64_t divisor_for_int8,
+    const std::optional<Tensor>& filtering_bit_index,
+    const std::optional<std::vector<Tensor>>& /* list_per_embedding_scale */,
+    bool /* fuse */) {
+  const auto n = list_cluster_offsets.size();
+  auto list_of_scores = std::vector<Tensor>();
+  auto list_of_indices = std::vector<Tensor>();
+  list_of_scores.reserve(n);
+  list_of_indices.reserve(n);
+
+  for (size_t i = 0; i < n; ++i) {
+    auto [scores, indices] = fused_kmean_ann_cpu_with_partial_masks(
+        list_cluster_offsets[i],
+        list_selected_cluster_ids[i],
+        list_selected_cluster_lengths[i],
+        list_embeddings[i],
+        queries,
+        list_max_tensor_size_per_row[i],
+        list_partial_mask_column_counts_cumsum[i],
+        list_partial_mask_first_item_offset_in_column[i],
+        list_partial_mask_column_results[i],
+        invalid_index_value,
+        divisor_for_int8,
+        filtering_bit_index,
+        std::nullopt,
+        std::nullopt,
+        std::nullopt,
+        std::nullopt,
+        std::nullopt,
+        0,
+        0);
+    list_of_scores.push_back(std::move(scores));
+    list_of_indices.push_back(std::move(indices));
+  }
+
+  return std::make_tuple(std::move(list_of_scores), std::move(list_of_indices));
+}
+
 TORCH_LIBRARY_FRAGMENT(st, m) {
   // fused_kmean_ann: Fused KMeans-based Approximate Nearest Neighbor search.
   //
@@ -384,6 +434,24 @@ TORCH_LIBRARY_FRAGMENT(st, m) {
       "int total_cluster_rounded_warps=0, "
       "int total_cluster_remaining_warps=0 "
       ") -> (Tensor, Tensor)");
+
+  m.def(
+      "fused_kmean_ann_with_partial_masks_multiple("
+      "Tensor queries, "
+      "Tensor[] list_cluster_offsets, "
+      "Tensor[] list_selected_cluster_ids, "
+      "Tensor[] list_selected_cluster_lengths, "
+      "Tensor[] list_embeddings, "
+      "int[] list_max_tensor_size_per_row, "
+      "Tensor[] list_partial_mask_column_counts_cumsum, "
+      "Tensor[] list_partial_mask_first_item_offset_in_column, "
+      "Tensor[] list_partial_mask_column_results, "
+      "int invalid_index_value=-1, "
+      "int divisor_for_int8=-1, "
+      "Tensor? filtering_bit_index=None, "
+      "Tensor[]? list_per_embedding_scale=None, "
+      "bool fuse=False "
+      ") -> (Tensor[], Tensor[])");
 }
 
 TORCH_LIBRARY_IMPL(st, CPU, m) {
@@ -398,6 +466,14 @@ TORCH_LIBRARY_IMPL(st, CPU, m) {
       torch::dispatch(
           c10::DispatchKey::CPU,
           TORCH_FN(fused_kmean_ann_cpu_with_partial_masks)));
+}
+
+TORCH_LIBRARY_IMPL(st, CPU, m) {
+  m.impl(
+      "fused_kmean_ann_with_partial_masks_multiple",
+      torch::dispatch(
+          c10::DispatchKey::CPU,
+          TORCH_FN(fused_kmean_ann_with_partial_masks_multiple_cpu)));
 }
 
 } // namespace st::ops::fused_kmean_ann
