@@ -39,4 +39,23 @@ bloom_index_search_batch_return_partial_response_cpu(
     int64_t hash_k,
     const std::optional<at::Tensor>& query_plan_index);
 
+// Runs bloom_index_search_batch_return_partial_response over a list of bloom
+// indices (chunks), returning a per-chunk list of results. The query plans are
+// shared across all chunks.
+std::tuple<
+    std::vector<at::Tensor>,
+    std::vector<at::Tensor>,
+    std::vector<at::Tensor>>
+bloom_index_search_batch_return_partial_response_multiple_cpu(
+    const std::vector<at::Tensor>& list_bloom_index,
+    const std::vector<at::Tensor>& list_bloom_bundle_b_offsets,
+    const at::Tensor& bloom_query_plans_data,
+    const at::Tensor& bloom_query_plans_offsets,
+    const std::vector<at::Tensor>& list_selected_cluster_offsets,
+    const std::vector<at::Tensor>& list_selected_cluster_lengths,
+    int64_t k,
+    int64_t hash_k,
+    const std::optional<at::Tensor>& query_plan_index,
+    bool fuse);
+
 } // namespace st::ops::bloom_search

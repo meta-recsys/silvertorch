@@ -417,6 +417,75 @@ bloom_index_search_batch_return_partial_response_cpu(
       query_plan_index);
 }
 
+std::tuple<std::vector<Tensor>, std::vector<Tensor>, std::vector<Tensor>>
+bloom_index_search_batch_return_partial_response_multiple_cpu(
+    const std::vector<Tensor>& list_bloom_index,
+    const std::vector<Tensor>& list_bloom_bundle_b_offsets,
+    const Tensor& bloom_query_plans_data,
+    const Tensor& bloom_query_plans_offsets,
+    const std::vector<Tensor>& list_selected_cluster_offsets,
+    const std::vector<Tensor>& list_selected_cluster_lengths,
+    int64_t k,
+    int64_t hash_k,
+    const std::optional<Tensor>& query_plan_index,
+    bool /* fuse */) {
+  // fuse only affects the CUDA path; the CPU path always loops per chunk.
+  const auto n = list_bloom_index.size();
+  TORCH_CHECK(
+      n > 0,
+      "bloom_index_search_batch_return_partial_response_multiple: "
+      "list_bloom_index should not be empty.");
+  TORCH_CHECK(
+      list_bloom_bundle_b_offsets.size() == n,
+      "list_bloom_index and list_bloom_bundle_b_offsets should have the same size, got ",
+      n,
+      " vs ",
+      list_bloom_bundle_b_offsets.size());
+  TORCH_CHECK(
+      list_selected_cluster_offsets.size() == n,
+      "list_bloom_index and list_selected_cluster_offsets should have the same size, got ",
+      n,
+      " vs ",
+      list_selected_cluster_offsets.size());
+  TORCH_CHECK(
+      list_selected_cluster_lengths.size() == n,
+      "list_bloom_index and list_selected_cluster_lengths should have the same size, got ",
+      n,
+      " vs ",
+      list_selected_cluster_lengths.size());
+
+  std::vector<Tensor> list_column_counts_cumsum;
+  list_column_counts_cumsum.reserve(n);
+  std::vector<Tensor> list_first_item_offsets_in_column;
+  list_first_item_offsets_in_column.reserve(n);
+  std::vector<Tensor> list_column_mask_response;
+  list_column_mask_response.reserve(n);
+  for (size_t i = 0; i < n; ++i) {
+    auto
+        [column_counts_cumsum,
+         first_item_offsets_in_column,
+         column_mask_response] =
+            bloom_index_search_common_return_partial_response(
+                list_bloom_index[i],
+                list_bloom_bundle_b_offsets[i],
+                bloom_query_plans_data,
+                bloom_query_plans_offsets,
+                list_selected_cluster_offsets[i],
+                list_selected_cluster_lengths[i],
+                k,
+                hash_k,
+                query_plan_index);
+    list_column_counts_cumsum.push_back(std::move(column_counts_cumsum));
+    list_first_item_offsets_in_column.push_back(
+        std::move(first_item_offsets_in_column));
+    list_column_mask_response.push_back(std::move(column_mask_response));
+  }
+  return std::make_tuple(
+      std::move(list_column_counts_cumsum),
+      std::move(list_first_item_offsets_in_column),
+      std::move(list_column_mask_response));
+}
+
 static std::tuple<Tensor, Tensor, Tensor> generate_column_info_for_clusters_cpu(
     const Tensor& selected_cluster_offsets,
     const Tensor& selected_cluster_lengths) {
@@ -500,6 +569,20 @@ TORCH_LIBRARY_FRAGMENT(st, m) {
       "int hash_k, "
       "Tensor? query_plan_index=None)"
       "-> (Tensor, Tensor, Tensor)");
+
+  m.def(
+      "bloom_index_search_batch_return_partial_response_multiple("
+      "Tensor[] list_bloom_index, "
+      "Tensor[] list_bloom_bundle_b_offsets, "
+      "Tensor bloom_query_plans_data, "
+      "Tensor bloom_query_plans_offsets, "
+      "Tensor[] list_selected_cluster_offsets, "
+      "Tensor[] list_selected_cluster_lengths, "
+      "int k, "
+      "int hash_k, "
+      "Tensor? query_plan_index=None, "
+      "bool fuse=False)"
+      "-> (Tensor[], Tensor[], Tensor[])");
 }
 
 TORCH_LIBRARY_IMPL(st, CPU, m) {
@@ -515,6 +598,15 @@ TORCH_LIBRARY_IMPL(st, CPU, m) {
       torch::dispatch(
           c10::DispatchKey::CPU,
           TORCH_FN(bloom_index_search_batch_return_partial_response_cpu)));
+}
+
+TORCH_LIBRARY_IMPL(st, CPU, m) {
+  m.impl(
+      "bloom_index_search_batch_return_partial_response_multiple",
+      torch::dispatch(
+          c10::DispatchKey::CPU,
+          TORCH_FN(
+              bloom_index_search_batch_return_partial_response_multiple_cpu)));
 }
 
 TORCH_LIBRARY_IMPL(st, CPU, m) {

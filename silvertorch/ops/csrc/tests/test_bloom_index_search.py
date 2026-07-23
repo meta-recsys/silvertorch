@@ -419,3 +419,201 @@ class TestBloomIndexSearchReturnPartialResponse(unittest.TestCase):
         )
         self.assertEqual(col_cumsum.numel(), 4 * 2)
         self.assertEqual(offsets_in_col.numel(), 4 * 2)
+
+
+# ---------------------------------------------------------------------------
+# bloom_index_search_batch_return_partial_response_multiple tests
+# ---------------------------------------------------------------------------
+
+
+def _search_partial_multiple(
+    list_bloom_index: list[torch.Tensor],
+    list_bundle_b_offsets: list[torch.Tensor],
+    plans_data: torch.Tensor,
+    plans_offsets: torch.Tensor,
+    list_selected_cluster_offsets: list[torch.Tensor],
+    list_selected_cluster_lengths: list[torch.Tensor],
+    device: str = "cpu",
+    k: int = 3,
+    hash_k: int = 7,
+    fuse: bool = False,
+) -> tuple[list[torch.Tensor], list[torch.Tensor], list[torch.Tensor]]:
+    return torch.ops.st.bloom_index_search_batch_return_partial_response_multiple(
+        [t.to(device) for t in list_bloom_index],
+        [t.to(device) for t in list_bundle_b_offsets],
+        plans_data.to(device),
+        plans_offsets.to(device),
+        [t.to(device) for t in list_selected_cluster_offsets],
+        [t.to(device) for t in list_selected_cluster_lengths],
+        k,
+        hash_k,
+        None,  # query_plan_index
+        fuse,
+    )
+
+
+class TestBloomIndexSearchReturnPartialResponseMultiple(unittest.TestCase):
+    """Tests for bloom_index_search_batch_return_partial_response_multiple op."""
+
+    def _build_multi_test_data(
+        self,
+        docs: tuple[int, ...] = (256, 128),
+        num_features: int = 3,
+        hash_k: int = 7,
+        num_queries: int = 2,
+        num_clusters: int = 2,
+    ) -> dict:
+        list_bloom_index = []
+        list_bundle_b_offsets = []
+        list_selected_cluster_offsets = []
+        list_selected_cluster_lengths = []
+        for num_docs in docs:
+            feature_ids, feature_offsets, feature_values = _make_features(
+                num_docs, num_features
+            )
+            bloom_index, bundle_b_offsets = _build_index(
+                feature_ids, feature_offsets, feature_values, "cpu", hash_k
+            )
+            list_bloom_index.append(bloom_index)
+            list_bundle_b_offsets.append(bundle_b_offsets)
+            docs_per_cluster = num_docs // num_clusters
+            offsets = []
+            lengths = []
+            for _ in range(num_queries):
+                offsets.append([c * docs_per_cluster for c in range(num_clusters)])
+                lengths.append([docs_per_cluster for _ in range(num_clusters)])
+            list_selected_cluster_offsets.append(
+                torch.tensor(offsets, dtype=torch.long)
+            )
+            list_selected_cluster_lengths.append(
+                torch.tensor(lengths, dtype=torch.long)
+            )
+        plans_data, plans_offsets = _parse_queries(["0:0"] * num_queries, hash_k)
+        return {
+            "list_bloom_index": list_bloom_index,
+            "list_bundle_b_offsets": list_bundle_b_offsets,
+            "plans_data": plans_data,
+            "plans_offsets": plans_offsets,
+            "list_selected_cluster_offsets": list_selected_cluster_offsets,
+            "list_selected_cluster_lengths": list_selected_cluster_lengths,
+            "hash_k": hash_k,
+        }
+
+    def test_cpu_basic(self) -> None:
+        data = self._build_multi_test_data()
+        num_chunks = len(data["list_bloom_index"])
+        list_cc, list_fio, list_cmr = _search_partial_multiple(
+            data["list_bloom_index"],
+            data["list_bundle_b_offsets"],
+            data["plans_data"],
+            data["plans_offsets"],
+            data["list_selected_cluster_offsets"],
+            data["list_selected_cluster_lengths"],
+            "cpu",
+            hash_k=data["hash_k"],
+        )
+        self.assertEqual(len(list_cc), num_chunks)
+        self.assertEqual(len(list_fio), num_chunks)
+        self.assertEqual(len(list_cmr), num_chunks)
+        for i in range(num_chunks):
+            self.assertEqual(list_cc[i].dtype, torch.int32)
+            self.assertEqual(list_fio[i].dtype, torch.int8)
+            self.assertEqual(list_cmr[i].dtype, torch.long)
+            num_queries = data["list_selected_cluster_offsets"][i].size(0)
+            num_clusters = data["list_selected_cluster_offsets"][i].size(1)
+            self.assertEqual(list_cc[i].numel(), num_queries * num_clusters)
+            self.assertEqual(list_fio[i].numel(), num_queries * num_clusters)
+
+    def test_matches_single_looped(self) -> None:
+        # The multiple op must match the single-chunk op looped over chunks.
+        data = self._build_multi_test_data(docs=(256, 128, 192))
+        list_cc, list_fio, list_cmr = _search_partial_multiple(
+            data["list_bloom_index"],
+            data["list_bundle_b_offsets"],
+            data["plans_data"],
+            data["plans_offsets"],
+            data["list_selected_cluster_offsets"],
+            data["list_selected_cluster_lengths"],
+            "cpu",
+            hash_k=data["hash_k"],
+        )
+        for i in range(len(data["list_bloom_index"])):
+            cc_single, fio_single, cmr_single = _search_partial(
+                data["list_bloom_index"][i],
+                data["list_bundle_b_offsets"][i],
+                data["plans_data"],
+                data["plans_offsets"],
+                data["list_selected_cluster_offsets"][i],
+                data["list_selected_cluster_lengths"][i],
+                "cpu",
+                hash_k=data["hash_k"],
+            )
+            self.assertTrue(torch.equal(cc_single, list_cc[i]))
+            self.assertTrue(torch.equal(fio_single, list_fio[i]))
+            self.assertTrue(torch.equal(cmr_single, list_cmr[i]))
+
+    def test_cpu_gpu_match(self) -> None:
+        if not HAS_CUDA:
+            self.skipTest("CUDA not available")
+        data = self._build_multi_test_data(docs=(256, 128, 192))
+        cpu_result = _search_partial_multiple(
+            data["list_bloom_index"],
+            data["list_bundle_b_offsets"],
+            data["plans_data"],
+            data["plans_offsets"],
+            data["list_selected_cluster_offsets"],
+            data["list_selected_cluster_lengths"],
+            "cpu",
+            hash_k=data["hash_k"],
+        )
+        gpu_result = _search_partial_multiple(
+            data["list_bloom_index"],
+            data["list_bundle_b_offsets"],
+            data["plans_data"],
+            data["plans_offsets"],
+            data["list_selected_cluster_offsets"],
+            data["list_selected_cluster_lengths"],
+            "cuda",
+            hash_k=data["hash_k"],
+        )
+        for out_idx in range(3):
+            for i in range(len(cpu_result[out_idx])):
+                torch.testing.assert_close(
+                    cpu_result[out_idx][i],
+                    gpu_result[out_idx][i].cpu(),
+                    msg=lambda m: f"CPU/GPU mismatch on output {out_idx} chunk {i}: {m}",
+                )
+
+    def test_fuse_matches_nofuse(self) -> None:
+        if not HAS_CUDA:
+            self.skipTest("CUDA not available")
+        data = self._build_multi_test_data(docs=(256, 128, 192))
+        nofuse = _search_partial_multiple(
+            data["list_bloom_index"],
+            data["list_bundle_b_offsets"],
+            data["plans_data"],
+            data["plans_offsets"],
+            data["list_selected_cluster_offsets"],
+            data["list_selected_cluster_lengths"],
+            "cuda",
+            hash_k=data["hash_k"],
+            fuse=False,
+        )
+        fused = _search_partial_multiple(
+            data["list_bloom_index"],
+            data["list_bundle_b_offsets"],
+            data["plans_data"],
+            data["plans_offsets"],
+            data["list_selected_cluster_offsets"],
+            data["list_selected_cluster_lengths"],
+            "cuda",
+            hash_k=data["hash_k"],
+            fuse=True,
+        )
+        for out_idx in range(3):
+            for i in range(len(nofuse[out_idx])):
+                torch.testing.assert_close(
+                    fused[out_idx][i].cpu(),
+                    nofuse[out_idx][i].cpu(),
+                    msg=lambda m: f"fuse/no-fuse mismatch on output {out_idx} chunk {i}: {m}",
+                )
