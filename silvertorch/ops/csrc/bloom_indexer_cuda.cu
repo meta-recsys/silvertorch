@@ -54,6 +54,40 @@
 #define ST_CUB_NS ::cub
 #endif
 
+// CCCL 3.0 (shipped with CUDA 13.0) deleted the `cub::Max` functor and the CUB
+// fancy iterators; the replacements live in `::cuda` and `::thrust`. See
+// https://nvidia.github.io/cccl/cccl/3.0_migration_guide.html
+//
+// hipcub reports the CCCL version it bundles under a different macro, and old
+// hipcub predates CCCL versioning entirely, so normalize to ST_CUB_VERSION
+// first (mirroring <ATen/cuda/cub_definitions.cuh>).
+#if defined(USE_ROCM)
+#if defined(HIPCUB_CCCL_VERSION)
+#define ST_CUB_VERSION HIPCUB_CCCL_VERSION
+#else
+#define ST_CUB_VERSION 200001
+#endif
+#else
+#define ST_CUB_VERSION CUB_VERSION
+#endif
+
+#if ST_CUB_VERSION >= 200800
+#include <thrust/iterator/counting_iterator.h>
+#include <thrust/iterator/transform_iterator.h>
+#include <cuda/functional>
+#define ST_CUB_MAXIMUM() ::cuda::maximum<>()
+#define ST_CUB_COUNTING_ITERATOR(T) ::thrust::counting_iterator<T>
+// ValueT is unused here: thrust deduces the value type from OpT, whereas
+// cub::TransformInputIterator took it as an explicit leading argument.
+#define ST_CUB_TRANSFORM_ITERATOR(ValueT, OpT, IterT) \
+  ::thrust::transform_iterator<OpT, IterT>
+#else
+#define ST_CUB_MAXIMUM() ST_CUB_NS::Max()
+#define ST_CUB_COUNTING_ITERATOR(T) ST_CUB_NS::CountingInputIterator<T, T>
+#define ST_CUB_TRANSFORM_ITERATOR(ValueT, OpT, IterT) \
+  ST_CUB_NS::TransformInputIterator<ValueT, OpT, IterT>
+#endif
+
 #ifndef CUB_WRAPPER
 #define CUB_WRAPPER(func, ...)                                      \
   do {                                                              \
@@ -289,7 +323,7 @@ __global__ void generate_column_b_and_signature_sizes_kernel(
 
     int32_t column_max_feature_count =
         WarpReduce(temp_storage[warp_id % BLOOM_BUILD_V2_WARP_PER_BLOCK])
-            .Reduce(max_feature_count, cub::Max());
+            .Reduce(max_feature_count, ST_CUB_MAXIMUM());
     if (tidx == 0) {
       int64_t b_size =
           static_cast<int64_t>(column_max_feature_count * k * b_multiplier);
@@ -346,10 +380,9 @@ std::tuple<Tensor, Tensor> generate_column_b_and_signature_offsets(
     at::cumsum_out(signature_sizes, signature_sizes, 0);
     return std::make_tuple(std::move(b_sizes), std::move(signature_sizes));
   } else {
-    using counting_iter_t =
-        ST_CUB_NS::CountingInputIterator<uint32_t, uint32_t>;
-    using bundle_key_iter_t = ST_CUB_NS::
-        TransformInputIterator<uint32_t, ColumnIdxToBundleKey, counting_iter_t>;
+    using counting_iter_t = ST_CUB_COUNTING_ITERATOR(uint32_t);
+    using bundle_key_iter_t = ST_CUB_TRANSFORM_ITERATOR(
+        uint32_t, ColumnIdxToBundleKey, counting_iter_t);
     bundle_key_iter_t bundle_key_iter(
         counting_iter_t(0), ColumnIdxToBundleKey());
     int64_t bundle_count =
@@ -368,7 +401,7 @@ std::tuple<Tensor, Tensor> generate_column_b_and_signature_offsets(
         b_sizes.data_ptr<int64_t>() + 1,
         bundle_b_sizes.data_ptr<int64_t>() + 1,
         num_of_runs_out.data_ptr<uint32_t>(),
-        ST_CUB_NS::Max(),
+        ST_CUB_MAXIMUM(),
         column_count,
         at::cuda::getCurrentCUDAStream());
     CUB_WRAPPER(
@@ -378,7 +411,7 @@ std::tuple<Tensor, Tensor> generate_column_b_and_signature_offsets(
         signature_sizes.data_ptr<int64_t>() + 1,
         bundle_signature_sizes.data_ptr<int64_t>() + 1,
         num_of_runs_out.data_ptr<uint32_t>(),
-        ST_CUB_NS::Max(),
+        ST_CUB_MAXIMUM(),
         column_count,
         at::cuda::getCurrentCUDAStream());
     at::cumsum_out(bundle_b_sizes, bundle_b_sizes, 0);
@@ -609,7 +642,7 @@ __global__ void generate_bloom_index_without_signature_kernel(
           cardinality = static_cast<uint32_t>(value_end - value_start);
         }
         uint32_t max_cardinality = WarpReduce(temp_storage[local_warp_id])
-                                       .Reduce(cardinality, cub::Max());
+                                       .Reduce(cardinality, ST_CUB_MAXIMUM());
         WARP_SYNC();
 
         // for each cardinality/feature_value, update bloom index for current
