@@ -13,3 +13,7 @@
 # limitations under the License.
 
 # pyre-unsafe
+
+from silvertorch.ops.rerank import rerank_scores_fp32  # noqa: F401
+
+__all__ = ["rerank_scores_fp32"]

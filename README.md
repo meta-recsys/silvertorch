@@ -87,6 +87,29 @@ Run the OSS test suite:
 pytest silvertorch/
 ```
 
+### FP32 candidate reranking
+
+`rerank_scores_fp32` computes exact FP32 dot products for candidate IDs.
+Its optional compiled path can fuse the gather and reduction instead of
+materializing a `(batch, candidates, dimension)` multiplication result:
+
+```python
+from silvertorch.ops import rerank_scores_fp32
+
+# Warm once before measuring steady-state latency.
+scores = rerank_scores_fp32(
+    embeddings,
+    queries,
+    candidate_ids,
+    use_compile=True,
+)
+```
+
+The eager implementation remains the default and requires no compilation.
+Invalid or padding candidate IDs receive `-inf` scores.  FP32 reduction
+order can differ between eager and compiled execution, so nearly tied scores
+may produce a different final ordering.
+
 ### 4. CPU-only build
 
 If `torch.cuda.is_available()` returns False at install time, `setup.py`
