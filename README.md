@@ -87,6 +87,31 @@ Run the OSS test suite:
 pytest silvertorch/
 ```
 
+### Tight candidate capacity for clustered ANN
+
+The low-level `torch.ops.st.fused_kmean_ann` operator requires callers to
+choose an output width.  A global worst-case bound can waste memory and make
+the downstream top-k scan unnecessary padding.  `clustered_ann_search` can
+derive the exact width required by the clusters selected for the current
+batch:
+
+```python
+from silvertorch.ops import clustered_ann_search
+
+scores, indices = clustered_ann_search(
+    cluster_offsets,
+    selected_cluster_ids,
+    selected_cluster_lengths,
+    embeddings,
+    queries,
+)
+```
+
+Computing a per-batch capacity from a CUDA tensor synchronizes with the CPU.
+For CUDA Graphs or latency-sensitive workloads, pass a cached conservative
+`max_tensor_size_per_row` instead.  Capacity must be based on complete
+selected cluster lengths even when filtering is enabled.
+
 ### 4. CPU-only build
 
 If `torch.cuda.is_available()` returns False at install time, `setup.py`

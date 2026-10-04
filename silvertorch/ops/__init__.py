@@ -13,3 +13,13 @@
 # limitations under the License.
 
 # pyre-unsafe
+
+from silvertorch.ops.clustered_ann import (  # noqa: F401
+    clustered_ann_search,
+    selected_cluster_capacity,
+)
+
+__all__ = [
+    "clustered_ann_search",
+    "selected_cluster_capacity",
+]
