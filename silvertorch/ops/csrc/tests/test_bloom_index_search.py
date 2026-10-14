@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# pyre-unsafe
 
 """Tests for bloom_index_search_batch and generate_column_info_for_clusters
 -- CPU and GPU cross-validated."""

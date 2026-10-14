@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# pyre-unsafe
 
 """Tests that the OSS package structure would work after ShipIt transformation.
 

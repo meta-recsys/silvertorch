@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# pyre-unsafe
 
 """Tests for fused_kmean_ann and knn_expand_cluster_offset_batch ops.
 

@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# pyre-unsafe
 
 from silvertorch.modules.bloom_index_search_module import (  # noqa: F401
     BloomIndexSearchModule,
