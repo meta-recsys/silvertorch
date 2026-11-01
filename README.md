@@ -272,6 +272,32 @@ For end-to-end CPU/GPU consistency tests and batched-query examples, see
 `silvertorch/ops/csrc/tests/test_bloom_search_integration.py` and
 `silvertorch/ops/csrc/tests/bloom_index_bench.py`.
 
+### Example 3 — K-means centroid routing
+
+`KMeansRoutingModule` L2-normalizes FP32 queries and selects the highest-scoring
+centroids. Routing is FP32 by default. On GPUs with fast half-precision matrix
+multiplication, FP16 routing can be enabled explicitly while the returned
+cluster IDs remain int64:
+
+```python
+import torch
+from silvertorch.modules import KMeansRoutingModule
+
+centroids = torch.randn(65_536, 256, device="cuda", dtype=torch.float32)
+routing = KMeansRoutingModule(
+    centroids,
+    nprobe=1_800,
+    use_fp16_routing=True,
+)
+cluster_ids = routing(torch.randn(16, 256, device="cuda"))
+```
+
+The precision choice is fixed when the module is constructed, so both modes
+can be captured in a CUDA graph. FP16 can change the selected clusters around
+score ties. PyTorch may also use reduced-precision FP16 accumulation when
+`torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction` is enabled.
+Measure retrieval recall on your own index before enabling FP16 routing.
+
 ---
 
 ## Troubleshooting

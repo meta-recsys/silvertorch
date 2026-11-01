@@ -59,18 +59,25 @@ class TestOssModuleImports(unittest.TestCase):
 
         self.assertTrue(callable(FilterQueryParserModuleBuilder))
 
+    def test_import_kmeans_routing_module(self) -> None:
+        from silvertorch.modules.kmeans_routing_module import KMeansRoutingModule
+
+        self.assertTrue(issubclass(KMeansRoutingModule, torch.nn.Module))
+
     def test_modules_init_exports(self) -> None:
         from silvertorch.modules import (
             BloomIndexSearchModule,
             BloomIndexSearchModuleBuilder,
             FilterQueryParserModule,
             FilterQueryParserModuleBuilder,
+            KMeansRoutingModule,
         )
 
         self.assertIsNotNone(BloomIndexSearchModule)
         self.assertIsNotNone(BloomIndexSearchModuleBuilder)
         self.assertIsNotNone(FilterQueryParserModule)
         self.assertIsNotNone(FilterQueryParserModuleBuilder)
+        self.assertIsNotNone(KMeansRoutingModule)
 
 
 class TestOssOpsRegistered(unittest.TestCase):

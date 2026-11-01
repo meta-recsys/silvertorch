@@ -26,10 +26,14 @@ from silvertorch.modules.filter_query_parser_module import (  # noqa: F401
 from silvertorch.modules.filter_query_parser_module_builder import (  # noqa: F401
     FilterQueryParserModuleBuilder,
 )
+from silvertorch.modules.kmeans_routing_module import (  # noqa: F401
+    KMeansRoutingModule,
+)
 
 __all__ = [
     "BloomIndexSearchModule",
     "BloomIndexSearchModuleBuilder",
     "FilterQueryParserModule",
     "FilterQueryParserModuleBuilder",
+    "KMeansRoutingModule",
 ]
