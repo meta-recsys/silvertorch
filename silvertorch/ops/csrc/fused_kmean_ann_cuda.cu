@@ -23,6 +23,8 @@
 #include <torch/torch.h> // @manual
 #include <ATen/cuda/DeviceUtils.cuh>
 #include <algorithm>
+#include <cstdlib>
+#include <cstring>
 #include <tuple>
 #include <utility>
 
@@ -51,6 +53,20 @@ namespace {
 
 constexpr int64_t kWarpThreadCount = 32;
 constexpr int64_t kBlockSize = 256L;
+
+#if !defined(USE_ROCM)
+// Eight lanes issue one contiguous 128-byte load group per document.
+constexpr int32_t kCooperativeThreadsPerDocument = 8;
+
+bool cooperative_int8_scan_enabled() {
+  static const bool enabled = [] {
+    const char* disable =
+        std::getenv("SILVERTORCH_DISABLE_COOPERATIVE_INT8_SCAN");
+    return disable == nullptr || std::strcmp(disable, "1") != 0;
+  }();
+  return enabled;
+}
+#endif
 
 // Multi-chunk warp payload kernel: processes ALL warps from ALL indices in one
 // launch. Each warp resolves its chunk via `warp_chunk_indices`, converts the
@@ -1071,6 +1087,131 @@ __global__ void process_cluster_remaining(
   }
 }
 
+#if !defined(USE_ROCM)
+template <typename RETURN_T, int DIM, int THREADS_PER_DOCUMENT>
+__global__ void process_cluster_cooperative_int8(
+    const int8_t* embeddings,
+    const int8_t* queries,
+    const WarpPayload* __restrict__ warp_payloads,
+    RETURN_T* results,
+    int32_t* indices,
+    int32_t total_needed_warps,
+    int32_t divisor_for_int8,
+    TORCH_DSA_KERNEL_ARGS) {
+  static_assert(
+      THREADS_PER_DOCUMENT == 4 || THREADS_PER_DOCUMENT == 8,
+      "cooperative int8 scan supports 4 or 8 threads per document");
+  static_assert(
+      DIM % (16 * THREADS_PER_DOCUMENT) == 0,
+      "DIM must be divisible by the cooperative vector width");
+  constexpr int32_t kDocumentsPerIteration =
+      kWarpThreadCount / THREADS_PER_DOCUMENT;
+
+  const int32_t lane = threadIdx.x;
+  const int32_t document_group = lane / THREADS_PER_DOCUMENT;
+  const bool writes_document = lane % THREADS_PER_DOCUMENT == 0;
+
+  for (uint32_t warp_index = blockIdx.x * blockDim.y + threadIdx.y;
+       warp_index < total_needed_warps;
+       warp_index += blockDim.y * gridDim.x) {
+    WarpPayload warp_payload;
+    warp_payload.payload = __ldg(
+        reinterpret_cast<const int4* __restrict__>(warp_payloads) + warp_index);
+    const int8_t* query =
+        queries + static_cast<int64_t>(warp_payload.cluster_ids_row) * DIM;
+
+#pragma unroll
+    for (int32_t iteration = 0; iteration < THREADS_PER_DOCUMENT;
+         ++iteration) {
+      const int32_t document_offset =
+          iteration * kDocumentsPerIteration + document_group;
+      const int64_t document_index =
+          warp_payload.doc_start_index + document_offset;
+      const int64_t write_index = warp_payload.write_index + document_offset;
+
+      const RETURN_T score = get_score<
+          int8_t,
+          RETURN_T,
+          DIM,
+          THREADS_PER_DOCUMENT,
+          false,
+          int32_t>(
+          embeddings + document_index * DIM, query, divisor_for_int8);
+      if (writes_document) {
+        results[write_index] = score;
+        indices[write_index] = static_cast<int32_t>(document_index);
+      }
+    }
+  }
+}
+
+template <typename RETURN_T, int DIM, int THREADS_PER_DOCUMENT>
+__global__ void process_cluster_remaining_cooperative_int8(
+    const int8_t* embeddings,
+    const int8_t* queries,
+    const RemainingPayload* __restrict__ remaining_payloads,
+    RETURN_T* results,
+    int32_t* indices,
+    int32_t remaining_docs,
+    int32_t divisor_for_int8,
+    TORCH_DSA_KERNEL_ARGS) {
+  static_assert(
+      THREADS_PER_DOCUMENT == 4 || THREADS_PER_DOCUMENT == 8,
+      "cooperative int8 scan supports 4 or 8 threads per document");
+  static_assert(
+      DIM % (16 * THREADS_PER_DOCUMENT) == 0,
+      "DIM must be divisible by the cooperative vector width");
+  constexpr int32_t kDocumentsPerWarp =
+      kWarpThreadCount / THREADS_PER_DOCUMENT;
+
+  const int32_t lane = threadIdx.x % kWarpThreadCount;
+  const int32_t warp_in_block = threadIdx.x / kWarpThreadCount;
+  const int32_t document_group = lane / THREADS_PER_DOCUMENT;
+  const bool writes_document = lane % THREADS_PER_DOCUMENT == 0;
+  const uint32_t global_warp =
+      blockIdx.x * (blockDim.x / kWarpThreadCount) + warp_in_block;
+  const uint32_t total_warps =
+      gridDim.x * (blockDim.x / kWarpThreadCount);
+  const uint32_t remaining_warp_work =
+      (remaining_docs + kDocumentsPerWarp - 1) / kDocumentsPerWarp;
+
+  // The loop condition is warp-uniform. In the final partial work item every
+  // lane still performs a valid dot product and reaches the full-mask shuffle;
+  // inactive document groups only suppress their leader's write.
+  for (uint32_t warp_work = global_warp; warp_work < remaining_warp_work;
+       warp_work += total_warps) {
+    const uint32_t process_index =
+        warp_work * kDocumentsPerWarp + document_group;
+    const bool active = process_index < static_cast<uint32_t>(remaining_docs);
+    const uint32_t safe_process_index =
+        active ? process_index : static_cast<uint32_t>(remaining_docs - 1);
+
+    RemainingPayload remaining_payload;
+    remaining_payload.payload = __ldg(
+        reinterpret_cast<const int4* __restrict__>(remaining_payloads) +
+        safe_process_index);
+    const int32_t document_index = remaining_payload.doc_index;
+    const int8_t* query = queries +
+        static_cast<int64_t>(remaining_payload.cluster_ids_row) * DIM;
+
+    const RETURN_T score = get_score<
+        int8_t,
+        RETURN_T,
+        DIM,
+        THREADS_PER_DOCUMENT,
+        false,
+        int32_t>(
+        embeddings + static_cast<int64_t>(document_index) * DIM,
+        query,
+        divisor_for_int8);
+    if (writes_document && active) {
+      results[remaining_payload.write_index] = score;
+      indices[remaining_payload.write_index] = document_index;
+    }
+  }
+}
+#endif
+
 template <
     typename EMBEDDING_T,
     typename RETURN_T,
@@ -1184,6 +1325,110 @@ __global__ void process_cluster_remaining_multi_emb(
 
 } // namespace
 
+#if !defined(USE_ROCM)
+template <typename RETURN_TYPE, int DIM, int THREADS_PER_DOCUMENT>
+inline void launch_cooperative_int8_scan(
+    const Tensor& embeddings,
+    const Tensor& queries,
+    const Tensor& warp_payloads,
+    Tensor& results,
+    Tensor& indices,
+    int32_t total_needed_warps,
+    int32_t divisor_for_int8,
+    const Tensor& remaining_payloads,
+    int32_t remaining_docs,
+    int64_t grid_size) {
+  constexpr int64_t kWarpsInBlock = kBlockSize / kWarpThreadCount;
+  const int64_t remaining_grid_size = std::min(
+      (static_cast<int64_t>(remaining_docs) * THREADS_PER_DOCUMENT +
+       kBlockSize - 1) /
+          kBlockSize,
+      192L * at::cuda::getCurrentDeviceProperties()->multiProcessorCount);
+
+  MAYBE_TORCH_DSA_KERNEL_LAUNCH(
+      (process_cluster_cooperative_int8<
+          RETURN_TYPE,
+          DIM,
+          THREADS_PER_DOCUMENT>),
+      grid_size,
+      dim3(kWarpThreadCount, kWarpsInBlock),
+      0,
+      at::cuda::getCurrentCUDAStream(),
+      embeddings.data_ptr<int8_t>(),
+      queries.data_ptr<int8_t>(),
+      reinterpret_cast<WarpPayload*>(warp_payloads.data_ptr<int8_t>()),
+      results.mutable_data_ptr<RETURN_TYPE>(),
+      indices.mutable_data_ptr<int32_t>(),
+      total_needed_warps,
+      divisor_for_int8);
+
+  MAYBE_TORCH_DSA_KERNEL_LAUNCH(
+      (process_cluster_remaining_cooperative_int8<
+          RETURN_TYPE,
+          DIM,
+          THREADS_PER_DOCUMENT>),
+      remaining_grid_size,
+      kBlockSize,
+      0,
+      at::cuda::getCurrentCUDAStream(),
+      embeddings.data_ptr<int8_t>(),
+      queries.data_ptr<int8_t>(),
+      reinterpret_cast<RemainingPayload*>(remaining_payloads.data_ptr<int8_t>()),
+      results.mutable_data_ptr<RETURN_TYPE>(),
+      indices.mutable_data_ptr<int32_t>(),
+      remaining_docs,
+      divisor_for_int8);
+}
+#endif
+
+template <
+    typename EMBEDDING_TYPE,
+    typename RETURN_TYPE,
+    int DIM,
+    bool FILTER>
+inline bool try_launch_cooperative_int8_scan(
+    bool has_per_embedding_scale,
+    bool query_on_shared_mem,
+    const Tensor& embeddings,
+    const Tensor& queries,
+    const Tensor& warp_payloads,
+    Tensor& results,
+    Tensor& indices,
+    int32_t total_needed_warps,
+    int32_t divisor_for_int8,
+    const Tensor& remaining_payloads,
+    int32_t remaining_docs,
+    int64_t grid_size) {
+#if !defined(USE_ROCM)
+  if constexpr (
+      std::is_same_v<EMBEDDING_TYPE, int8_t> && !FILTER && DIM <= 512 &&
+      DIM % (16 * kCooperativeThreadsPerDocument) == 0) {
+    if (has_per_embedding_scale || query_on_shared_mem) {
+      return false;
+    }
+    if (!cooperative_int8_scan_enabled()) {
+      return false;
+    }
+    launch_cooperative_int8_scan<
+        RETURN_TYPE,
+        DIM,
+        kCooperativeThreadsPerDocument>(
+        embeddings,
+        queries,
+        warp_payloads,
+        results,
+        indices,
+        total_needed_warps,
+        divisor_for_int8,
+        remaining_payloads,
+        remaining_docs,
+        grid_size);
+    return true;
+  }
+#endif
+  return false;
+}
+
 template <typename EMBEDDING_TYPE, typename RETURN_TYPE, int DIM, bool FILTER>
 inline bool try_launch_pipelined_kernel(
     bool use_pipelined_kernel,
@@ -1278,7 +1523,21 @@ std::tuple<Tensor, Tensor> fused_kmean_ann_run_payloads(
 #define INVOKE_KERNEL_WITH_TYPE_DIM_FILTER(                                   \
     EMBEDDING_TYPE, RETURN_TYPE, DIM, FILTER)                                 \
   {                                                                           \
-    if (per_embedding_scale.has_value()) {                                    \
+    if (try_launch_cooperative_int8_scan<                                     \
+            EMBEDDING_TYPE, RETURN_TYPE, DIM, FILTER>(                        \
+            per_embedding_scale.has_value(),                                  \
+            query_on_shared_mem,                                              \
+            embeddings,                                                       \
+            queries,                                                          \
+            warp_payloads,                                                    \
+            results,                                                          \
+            indices,                                                          \
+            static_cast<int32_t>(total_needed_warps),                         \
+            static_cast<int32_t>(divisor_for_int8),                           \
+            remaining_payloads,                                               \
+            static_cast<int32_t>(remaining_docs),                             \
+            grid_size)) {                                                     \
+    } else if (per_embedding_scale.has_value()) {                             \
       if (query_on_shared_mem) {                                              \
         MAYBE_TORCH_DSA_KERNEL_LAUNCH(                                        \
             (process_cluster<                                                 \
