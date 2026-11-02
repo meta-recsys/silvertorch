@@ -78,4 +78,17 @@ std::tuple<at::Tensor, at::Tensor> fused_kmean_ann_cuda(
     const std::optional<at::Tensor>& filtering_bit_index,
     const std::optional<at::Tensor>& per_embedding_scale);
 
+std::tuple<at::Tensor, at::Tensor, at::Tensor> fused_kmean_ann_cuda_graph(
+    const at::Tensor& cluster_offsets,
+    const at::Tensor& cluster_ids,
+    const at::Tensor& cluster_length,
+    const at::Tensor& embeddings,
+    const at::Tensor& queries,
+    int64_t max_tensor_size_per_row,
+    const std::optional<at::Tensor>& filtering_bit_mask,
+    int64_t invalid_index_value,
+    int64_t divisor_for_int8,
+    const std::optional<at::Tensor>& filtering_bit_index,
+    const std::optional<at::Tensor>& per_embedding_scale);
+
 } // namespace st::ops::fused_kmean_ann

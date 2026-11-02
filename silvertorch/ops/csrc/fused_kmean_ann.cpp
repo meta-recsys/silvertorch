@@ -412,6 +412,32 @@ TORCH_LIBRARY_FRAGMENT(st, m) {
       "Tensor? per_embedding_scale=None "
       ") -> (Tensor, Tensor)");
 
+  // CUDA-graph-safe variant of fused_kmean_ann. It uses fixed-capacity
+  // payload buffers and device-resident work counts, so no GPU scalar is read
+  // by the host. The third return value is a one-element int32 overflow flag.
+  // A value of 1 means max_tensor_size_per_row was too small and the output
+  // was safely truncated; unlike a device assertion this does not poison the
+  // CUDA context. Callers that derive a trusted static capacity may keep the
+  // flag on-device as part of the captured graph.
+  // When filtering_bit_index is provided, it must be a contiguous int64
+  // tensor of shape (B,), with every value in [0, filtering_bit_mask.size(0)).
+  // The caller must ensure this range on every replay: mapping values are
+  // not bounds-checked, and overflow reports output capacity only.
+  m.def(
+      "fused_kmean_ann_cuda_graph("
+      "Tensor cluster_offsets, "
+      "Tensor cluster_ids, "
+      "Tensor cluster_length, "
+      "Tensor embeddings, "
+      "Tensor queries, "
+      "int max_tensor_size_per_row, "
+      "Tensor? filtering_bit_mask=None, "
+      "int invalid_index_value=-1,"
+      "int divisor_for_int8=-1,"
+      "Tensor? filtering_bit_index=None, "
+      "Tensor? per_embedding_scale=None "
+      ") -> (Tensor, Tensor, Tensor)");
+
   m.def(
       "fused_kmean_ann_with_partial_masks("
       "Tensor cluster_offsets, "
