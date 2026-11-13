@@ -44,7 +44,6 @@ using namespace st::ops::bloom_index;
 namespace {
 
 static constexpr int32_t C_FAST_ROUTE_STACK_SIZE_FIRST_LEVEL = 16;
-static constexpr int32_t C_NUM_OFFSETS_PER_PLAN = 8;
 
 template <bool is_bloom_index_v2>
 struct QueryPlanCuda {
